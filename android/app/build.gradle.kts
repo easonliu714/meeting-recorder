@@ -6,7 +6,10 @@ plugins {
 }
 
 android {
-    namespace = "com.example.myapp"
+    // 關鍵修改 1：namespace 必須對應您的 Kotlin 檔案資料夾結構
+    // 您的 MainActivity 位於 com/example/myapp/MainActivity.kt，所以這裡必須是 myapp
+    namespace = "com.example.myapp" 
+    
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -20,10 +23,10 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.myapp"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        // 關鍵修改 2：applicationId 是您希望 App 在手機/商店顯示的真實 ID
+        // 根據您之前的 Manifest 設定，這裡應該是 meeting_recorder
+        applicationId = "com.example.meeting_recorder"
+        
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

@@ -1,22 +1,23 @@
-// --- 修改開始：引入新套件與升級資料模型 ---
+// --- lib/main.dart 修正與功能增強版 ---
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
-import 'package:file_picker/file_picker.dart'; // 新增
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // 用於載入字型
+import 'package:flutter/services.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:pdf/pdf.dart'; // 新增
-import 'package:pdf/widgets.dart' as pw; // 新增
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 import 'package:permission_handler/permission_handler.dart';
-import 'package:printing/printing.dart'; // 新增
+import 'package:printing/printing.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
-import 'package:youtube_explode_dart/youtube_explode_dart.dart'; // 新增
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,9 +28,10 @@ void main() async {
   );
 }
 
-// 新增狀態：downloading (下載中)
+// 狀態定義
 enum NoteStatus { downloading, processing, success, failed }
 
+// --- 資料模型 (保持不變) ---
 class TranscriptItem {
   String speaker;
   String text;
@@ -72,7 +74,6 @@ class TaskItem {
   );
 }
 
-// 新增：章節 (Section) 模型
 class Section {
   String title;
   double startTime;
@@ -101,7 +102,7 @@ class MeetingNote {
   List<String> summary;
   List<TaskItem> tasks;
   List<TranscriptItem> transcript;
-  List<Section> sections; // 新增：章節列表
+  List<Section> sections;
   String audioPath;
   NoteStatus status;
   bool isPinned;
@@ -147,23 +148,20 @@ class MeetingNote {
             ?.map((e) => TranscriptItem.fromJson(e))
             .toList() ??
         [],
-    // 相容舊資料
     sections:
         (json['sections'] as List<dynamic>?)
             ?.map((e) => Section.fromJson(e))
             .toList() ??
         [],
-    audioPath: json['audioPath'],
+    audioPath: json['audioPath'] ?? '',
     status: NoteStatus.values[json['status'] ?? 2],
     isPinned: json['isPinned'] ?? false,
   );
 }
 
-// 簡易全域管理器 (解決字典同步與錄音狀態共享)
+// --- GlobalManager (保持不變) ---
 class GlobalManager {
-  // 錄音狀態監聽
   static final ValueNotifier<bool> isRecordingNotifier = ValueNotifier(false);
-  // 字典監聽
   static final ValueNotifier<List<String>> vocabListNotifier = ValueNotifier(
     [],
   );
@@ -176,7 +174,7 @@ class GlobalManager {
   static Future<void> addVocab(String word) async {
     if (!vocabListNotifier.value.contains(word)) {
       final newList = List<String>.from(vocabListNotifier.value)..add(word);
-      vocabListNotifier.value = newList; // 通知 UI 更新
+      vocabListNotifier.value = newList;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList('vocab_list', newList);
     }
@@ -189,15 +187,18 @@ class GlobalManager {
     await prefs.setStringList('vocab_list', newList);
   }
 
-  // 新增：統一儲存筆記的方法 (供各頁面呼叫)
   static Future<void> saveNote(MeetingNote note) async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
     List<MeetingNote> notes = [];
     if (existingJson != null) {
-      notes = (jsonDecode(existingJson) as List)
-          .map((e) => MeetingNote.fromJson(e))
-          .toList();
+      try {
+        notes = (jsonDecode(existingJson) as List)
+            .map((e) => MeetingNote.fromJson(e))
+            .toList();
+      } catch (e) {
+        print("Error parsing notes: $e");
+      }
     }
     int index = notes.indexWhere((n) => n.id == note.id);
     if (index != -1) {
@@ -211,10 +212,9 @@ class GlobalManager {
     );
   }
 
-  // 新增：統一的 AI 分析邏輯
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
-    await saveNote(note);
+    await saveNote(note); // 先儲存狀態
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
@@ -225,15 +225,14 @@ class GlobalManager {
         prefs.getStringList('participant_list') ?? [];
 
     try {
-      if (apiKey.isEmpty) throw Exception("No API Key");
+      if (apiKey.isEmpty) throw Exception("請先至設定頁面輸入 API Key");
 
       final audioFile = File(note.audioPath);
-      if (!await audioFile.exists()) throw Exception("Audio file not found");
+      if (!await audioFile.exists()) throw Exception("找不到音訊檔案");
 
-      // 檔案大小檢查 (20MB 限制)
       int fileSize = await audioFile.length();
       if (fileSize > 20 * 1024 * 1024) {
-        throw Exception("檔案過大 (>20MB)。Gemini API 暫不支援，請先將音訊檔切割後再匯入。");
+        throw Exception("檔案過大 (>20MB)，Gemini API 無法處理。");
       }
 
       final model = GenerativeModel(model: modelName, apiKey: apiKey);
@@ -244,25 +243,15 @@ class GlobalManager {
       你是一個會議記錄助理。
       專有詞彙：${vocabList.join(', ')}。
       與會者名單：${participantList.join(', ')}。
-      
       請依據音訊內容回傳 JSON，格式如下：
       {
         "title": "會議標題",
         "summary": ["重點摘要1", "重點摘要2"],
         "tasks": [{"description": "任務", "assignee": "負責人", "dueDate": "YYYY-MM-DD"}],
-        "sections": [
-           {"title": "議題一：開場", "startTime": 0.0, "endTime": 120.0},
-           {"title": "議題二：財務報告", "startTime": 120.0, "endTime": 600.0}
-        ],
-        "transcript": [
-           {"speaker": "A", "text": "你好...", "startTime": 0.5},
-           {"speaker": "B", "text": "開始...", "startTime": 2.0}
-        ]
+        "sections": [{"title": "議題一", "startTime": 0.0, "endTime": 120.0}],
+        "transcript": [{"speaker": "A", "text": "你好...", "startTime": 0.5}]
       }
-      【重要規則】：
-      1. 'sections' 是段落大綱，請根據摘要將會議劃分為不同時間段。
-      2. 'transcript' 必須是【逐字稿】，請盡可能保留每一句對話，不要只寫摘要，要寫出完整對話內容。
-      3. 若對話極長，請務必將其分配到正確的 'sections' 時間區間內。
+      規則：sections 為段落大綱，transcript 為完整逐字稿。
       """;
 
       final response = await model.generateContent([
@@ -271,6 +260,8 @@ class GlobalManager {
           DataPart('audio/mp4', audioBytes),
         ]),
       ]);
+
+      if (response.text == null) throw Exception("AI 回傳空白");
 
       final jsonString = response.text!
           .replaceAll('```json', '')
@@ -296,7 +287,6 @@ class GlobalManager {
               .toList() ??
           [];
 
-      // 防呆：如果 AI 沒回傳 sections，自己產生一個預設的
       if (note.sections.isEmpty && note.transcript.isNotEmpty) {
         note.sections.add(
           Section(
@@ -317,11 +307,8 @@ class GlobalManager {
     }
   }
 }
-// --- 修改結束 ---
 
-// --- 2. 主畫面框架 ---
-// --- 修改開始：MainAppShell 新增上傳功能 ---
-// --- 修改開始：MainAppShell (YouTube 進度與檔案檢查) ---
+// --- MainAppShell (修正錄音與加入自動切割功能) ---
 class MainAppShell extends StatefulWidget {
   const MainAppShell({super.key});
   @override
@@ -334,6 +321,11 @@ class _MainAppShellState extends State<MainAppShell> {
   final Stopwatch _stopwatch = Stopwatch();
   Timer? _timer;
   String _timerText = "00:00";
+  // 計數器，用來標記連續錄音的段落 (Part 1, Part 2...)
+  int _recordingPart = 1;
+  // 紀錄開始錄音的時間，用於檔案命名
+  DateTime? _recordingSessionStartTime;
+
   final List<Widget> _pages = [const HomePage(), const SettingsPage()];
 
   @override
@@ -343,11 +335,12 @@ class _MainAppShellState extends State<MainAppShell> {
     super.dispose();
   }
 
-  // 切換錄音狀態
   void _toggleRecording() async {
     if (GlobalManager.isRecordingNotifier.value) {
-      await _stopAndAnalyze();
+      await _stopAndAnalyze(manualStop: true);
     } else {
+      _recordingPart = 1;
+      _recordingSessionStartTime = DateTime.now();
       await _startRecording();
     }
   }
@@ -355,68 +348,133 @@ class _MainAppShellState extends State<MainAppShell> {
   Future<void> _startRecording() async {
     if (await Permission.microphone.request().isGranted) {
       final dir = await getApplicationDocumentsDirectory();
-      final path = '${dir.path}/${const Uuid().v4()}.m4a';
+      // 檔名加上 Part 標記
+      final fileName =
+          "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$_recordingPart.m4a";
+      final path = '${dir.path}/$fileName';
+
       await _audioRecorder.start(
         const RecordConfig(encoder: AudioEncoder.aacLc),
         path: path,
       );
+
       _stopwatch.reset();
       _stopwatch.start();
-      _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+
+      // 每秒檢查一次時間與音量
+      _timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+        if (!mounted) return;
+
+        // 更新 UI 時間
         setState(() {
           _timerText =
               "${_stopwatch.elapsed.inMinutes.toString().padLeft(2, '0')}:${(_stopwatch.elapsed.inSeconds % 60).toString().padLeft(2, '0')}";
         });
+
+        // --- 自動切割邏輯 ---
+        final duration = _stopwatch.elapsed;
+        // 取得音量 (0 ~ -160 dB)
+        final amplitude = await _audioRecorder.getAmplitude();
+        final currentAmp = amplitude.current;
+
+        // 規則 1: 超過 29 分鐘 且 很安靜 (<-30dB) -> 切割
+        // 規則 2: 超過 30 分鐘 (強制切割)
+        if ((duration.inMinutes >= 29 && currentAmp < -30) ||
+            duration.inMinutes >= 30) {
+          print(
+            "Auto splitting recording at ${duration.inMinutes} mins (Amp: $currentAmp)",
+          );
+          await _handleAutoSplit();
+        }
       });
+
       GlobalManager.isRecordingNotifier.value = true;
+    } else {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text("需要麥克風權限")));
     }
   }
 
-  // --- 修改開始：MainAppShell 呼叫 GlobalManager ---
-  Future<void> _stopAndAnalyze() async {
+  // 自動切割處理
+  Future<void> _handleAutoSplit() async {
+    _timer?.cancel();
     final path = await _audioRecorder.stop();
     _stopwatch.stop();
-    _timer?.cancel();
-    GlobalManager.isRecordingNotifier.value = false;
-    if (path != null) _createNewNoteAndAnalyze(path, "新會議錄音");
+
+    if (path != null) {
+      // 1. 儲存並分析上一段
+      String title = "會議錄音 Part $_recordingPart";
+      if (_recordingSessionStartTime != null) {
+        title +=
+            " (${DateFormat('HH:mm').format(_recordingSessionStartTime!)})";
+      }
+      _createNewNoteAndAnalyze(path, title);
+    }
+
+    // 2. 準備下一段
+    _recordingPart++;
+    // 3. 立即開始新錄音
+    await _startRecording();
   }
 
-  // 統一的建立筆記邏輯
+  Future<void> _stopAndAnalyze({bool manualStop = false}) async {
+    _timer?.cancel();
+    final path = await _audioRecorder.stop();
+    _stopwatch.stop();
+    GlobalManager.isRecordingNotifier.value = false;
+
+    if (path != null) {
+      String title = manualStop && _recordingPart == 1
+          ? "會議錄音"
+          : "會議錄音 Part $_recordingPart";
+      _createNewNoteAndAnalyze(path, title);
+    }
+    setState(() {
+      _timerText = "00:00";
+    });
+  }
+
   void _createNewNoteAndAnalyze(String path, String defaultTitle) async {
     final newNote = MeetingNote(
       id: const Uuid().v4(),
       title:
-          "$defaultTitle (${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.now())})",
+          "$defaultTitle (${DateFormat('yyyy/MM/dd').format(DateTime.now())})",
       date: DateTime.now(),
       summary: ["AI 分析中..."],
       tasks: [],
       transcript: [],
-      sections: [], // 初始為空
+      sections: [],
       audioPath: path,
       status: NoteStatus.processing,
     );
     await GlobalManager.saveNote(newNote);
+
+    // 非同步執行分析，不卡 UI
     GlobalManager.analyzeNote(newNote);
+
     if (mounted) setState(() {});
   }
 
   // 上傳檔案邏輯
   // 匯入檔案：增加大小檢查提示
   Future<void> _pickFile() async {
+    // 請求儲存權限 (Android 13 以下需要，部分手機需要)
+    await Permission.storage.request();
+
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.audio,
     );
     if (result != null) {
       File file = File(result.files.single.path!);
       int size = await file.length();
-      // 20MB 警告 (1MB = 1048576 bytes)
       if (size > 20 * 1024 * 1024) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("警告：檔案超過 20MB，AI 分析可能會失敗。建議先切割檔案。"),
+              content: Text("警告：檔案超過 20MB，AI 分析可能會失敗。"),
               backgroundColor: Colors.orange,
-              duration: Duration(seconds: 5),
             ),
           );
         }
@@ -450,27 +508,24 @@ class _MainAppShellState extends State<MainAppShell> {
     );
 
     if (url != null && url.isNotEmpty) {
-      // 1. 先建立一個 "下載中" 的筆記
       final noteId = const Uuid().v4();
       final tempNote = MeetingNote(
         id: noteId,
-        title: "正在下載 YouTube 音訊...",
+        title: "下載中...",
         date: DateTime.now(),
-        summary: ["下載中..."],
+        summary: ["正在下載 YouTube 音訊..."],
         tasks: [],
         transcript: [],
         sections: [],
-        audioPath: "", // 暫時為空
-        status: NoteStatus.downloading, // 設定為下載中狀態
+        audioPath: "",
+        status: NoteStatus.downloading,
       );
       await GlobalManager.saveNote(tempNote);
-      if (mounted) setState(() {}); // 刷新首頁顯示
+      if (mounted) setState(() {});
 
       try {
         var yt = YoutubeExplode();
         var video = await yt.videos.get(url);
-
-        // 更新標題
         tempNote.title = "YT: ${video.title}";
         await GlobalManager.saveNote(tempNote);
 
@@ -487,24 +542,20 @@ class _MainAppShellState extends State<MainAppShell> {
         await fileStream.close();
         yt.close();
 
-        // 2. 下載完成，開始分析
         tempNote.audioPath = path;
         tempNote.status = NoteStatus.processing;
         tempNote.summary = ["AI 分析中..."];
         await GlobalManager.saveNote(tempNote);
-
         GlobalManager.analyzeNote(tempNote);
-        if (mounted) setState(() {});
       } catch (e) {
         tempNote.status = NoteStatus.failed;
         tempNote.summary = ["下載失敗: $e"];
         await GlobalManager.saveNote(tempNote);
-        if (mounted) setState(() {});
       }
+      if (mounted) setState(() {});
     }
   }
 
-  // 顯示新增選單
   void _showAddMenu() {
     showModalBottomSheet(
       context: context,
@@ -520,7 +571,7 @@ class _MainAppShellState extends State<MainAppShell> {
           ),
           ListTile(
             leading: const Icon(Icons.upload_file, color: Colors.orange),
-            title: const Text("上傳音訊檔 (m4a, mp3...)"),
+            title: const Text("上傳音訊檔"),
             onTap: () {
               Navigator.pop(ctx);
               _pickFile();
@@ -539,7 +590,6 @@ class _MainAppShellState extends State<MainAppShell> {
     );
   }
 
-  // --- 修改結束 ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -563,9 +613,24 @@ class _MainAppShellState extends State<MainAppShell> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     const Icon(Icons.mic, color: Colors.white),
-                    Text(
-                      "錄音中... $_timerText",
-                      style: const TextStyle(color: Colors.white),
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          "錄音中... $_timerText",
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          "Part $_recordingPart (自動分段: 30min)",
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
                     ),
                     IconButton(
                       icon: const Icon(Icons.stop_circle, color: Colors.white),
@@ -578,7 +643,6 @@ class _MainAppShellState extends State<MainAppShell> {
           ),
         ],
       ),
-      // --- 移除 FloatingActionButton，改在 BottomBar 中央 ---
       bottomNavigationBar: BottomAppBar(
         shape: const CircularNotchedRectangle(),
         notchMargin: 6.0,
@@ -594,14 +658,11 @@ class _MainAppShellState extends State<MainAppShell> {
                 ),
                 onPressed: () => setState(() => _currentIndex = 0),
               ),
-              // 中央按鈕改為 "+" 號，開啟多功能選單
               ValueListenableBuilder<bool>(
                 valueListenable: GlobalManager.isRecordingNotifier,
                 builder: (context, isRecording, child) {
                   return FloatingActionButton(
-                    onPressed: isRecording
-                        ? _toggleRecording
-                        : _showAddMenu, // 錄音中則為停止，否則開啟選單
+                    onPressed: isRecording ? _toggleRecording : _showAddMenu,
                     backgroundColor: isRecording
                         ? Colors.red
                         : Colors.blueAccent,
@@ -626,7 +687,6 @@ class _MainAppShellState extends State<MainAppShell> {
     );
   }
 }
-// --- 修改結束 ---
 
 // --- 3. 首頁：會議列表 (含狀態顯示) ---
 // --- 修改開始：HomePage 加入置頂與刪除 ---
@@ -1549,4 +1609,3 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 }
-// --- 修改結束 ---
