@@ -23,16 +23,19 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.1.0" apply false
 }
 
-// --- 新增這段 dependencyResolutionManagement ---
+include(":app")
+
+// --- 修正開始：依賴解析管理 ---
 dependencyResolutionManagement {
+    // 改為 PREFER_SETTINGS，強制所有模組使用這裡定義的倉庫
     repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
     repositories {
         google()
         mavenCentral()
-        maven { url = uri("https://jitpack.io") } // 關鍵：加入 JitPack
+        // 加入 JitPack (為了某些套件如 ffmpeg_kit 或其他依賴)
+        maven { url = uri("https://jitpack.io") }
+        // 加入 Flutter 的公開倉庫 (解決 io.flutter 找不到的問題)
+        maven { url = uri("https://storage.googleapis.com/download.flutter.io") }
     }
 }
-
-// ---------------------------------------------
-
-include(":app")
+// --- 修正結束 ---
