@@ -13,6 +13,7 @@ import 'package:uuid/uuid.dart';
 
 void main() {
   runApp(const MaterialApp(
+    title: 'MeetingAssistant', // 加入這一行
     debugShowCheckedModeBanner: false,
     home: MainAppShell(),
   ));
