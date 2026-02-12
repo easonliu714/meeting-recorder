@@ -23,4 +23,16 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.1.0" apply false
 }
 
+// --- 新增這段 dependencyResolutionManagement ---
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") } // 關鍵：加入 JitPack
+    }
+}
+
+// ---------------------------------------------
+
 include(":app")

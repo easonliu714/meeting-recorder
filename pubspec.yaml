@@ -52,6 +52,7 @@ dependencies:
   printing: ^5.11.0        # PDF 列印與預覽
   youtube_explode_dart: ^2.2.0 # YouTube 音訊下載
   http: ^1.2.0             # 網路請求輔助
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
