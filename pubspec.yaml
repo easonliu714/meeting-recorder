@@ -46,6 +46,12 @@ dependencies:
   uuid: ^4.3.3
   # 新增：音訊播放器
   audioplayers: ^6.0.0
+  # --- 新增以下套件 ---
+  file_picker: ^8.0.0      # 檔案選取
+  pdf: ^3.10.0             # PDF 生成核心
+  printing: ^5.11.0        # PDF 列印與預覽
+  youtube_explode_dart: ^2.2.0 # YouTube 音訊下載
+  http: ^1.2.0             # 網路請求輔助
 dev_dependencies:
   flutter_test:
     sdk: flutter
