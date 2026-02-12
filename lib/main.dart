@@ -49,7 +49,85 @@ class GlobalManager {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('vocab_list', newList);
   }
+
+  // 新增：統一儲存筆記的方法 (供各頁面呼叫)
+  static Future<void> saveNote(MeetingNote note) async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? existingJson = prefs.getString('meeting_notes');
+    List<MeetingNote> notes = [];
+    if (existingJson != null) {
+      notes = (jsonDecode(existingJson) as List).map((e) => MeetingNote.fromJson(e)).toList();
+    }
+    int index = notes.indexWhere((n) => n.id == note.id);
+    if (index != -1) {
+      notes[index] = note;
+    } else {
+      notes.add(note);
+    }
+    await prefs.setString('meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
+  }
+
+  // 新增：統一的 AI 分析邏輯
+  static Future<void> analyzeNote(MeetingNote note) async {
+    // 1. 設定狀態為處理中並存檔
+    note.status = NoteStatus.processing;
+    await saveNote(note);
+
+    final prefs = await SharedPreferences.getInstance();
+    final apiKey = prefs.getString('api_key') ?? '';
+    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
+    final List<String> vocabList = vocabListNotifier.value;
+
+    try {
+      if (apiKey.isEmpty) throw Exception("No API Key");
+      
+      final model = GenerativeModel(model: modelName, apiKey: apiKey);
+      final audioFile = File(note.audioPath);
+      if (!await audioFile.exists()) throw Exception("Audio file not found");
+      
+      final audioBytes = await audioFile.readAsBytes();
+
+      // Prompt: 要求回傳包含 timestamp 的 JSON
+      String systemInstruction = """
+      你是一個會議記錄助理。
+      專有詞彙：${vocabList.join(', ')}。
+      
+      請分析音訊並回傳 JSON 格式 (不要 Markdown)：
+      {
+        "title": "會議標題",
+        "summary": "摘要",
+        "tasks": ["待辦1"],
+        "transcript": [
+           {"speaker": "A", "text": "大家好", "startTime": 0.5},
+           {"speaker": "B", "text": "開始報告", "startTime": 5.2}
+        ]
+      }
+      startTime 請使用秒數 (例如 12.5)。
+      """;
+
+      final response = await model.generateContent([
+        Content.multi([TextPart(systemInstruction), DataPart('audio/mp4', audioBytes)])
+      ]);
+
+      final jsonString = response.text!.replaceAll('```json', '').replaceAll('```', '').trim();
+      final Map<String, dynamic> result = jsonDecode(jsonString);
+
+      note.title = result['title'] ?? note.title;
+      note.summary = result['summary'] ?? '';
+      note.tasks = List<String>.from(result['tasks'] ?? []);
+      note.transcript = (result['transcript'] as List<dynamic>?)?.map((e) => TranscriptItem.fromJson(e)).toList() ?? [];
+      note.status = NoteStatus.success;
+
+      await saveNote(note);
+    } catch (e) {
+      print("AI Error: $e");
+      note.status = NoteStatus.failed;
+      note.summary = "分析失敗: $e"; // 將錯誤訊息寫入 summary 以便顯示
+      await saveNote(note);
+    }
+  }
 }
+// --- 修改結束 ---
 
 // --- 1. 資料模型 (新增狀態與時間戳記) ---
 
@@ -174,7 +252,7 @@ class _MainAppShellState extends State<MainAppShell> {
       GlobalManager.isRecordingNotifier.value = true;
     }
   }
-
+// --- 修改開始：MainAppShell 呼叫 GlobalManager ---
   Future<void> _stopAndAnalyze() async {
     final path = await _audioRecorder.stop();
     _stopwatch.stop();
@@ -194,80 +272,16 @@ class _MainAppShellState extends State<MainAppShell> {
         status: NoteStatus.processing,
       );
 
-      await _saveNoteToLocal(newNote);
-      // 這裡不需等待，背景執行
-      _processAiInBackground(newNote);
+      // 改用 GlobalManager 的方法
+      await GlobalManager.saveNote(newNote);
+      GlobalManager.analyzeNote(newNote); // 背景執行分析
       
       // 刷新首頁 (如果當前在首頁)
       if (mounted) setState(() {});
     }
   }
-
-  // 儲存邏輯
-  Future<void> _saveNoteToLocal(MeetingNote note) async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? existingJson = prefs.getString('meeting_notes');
-    List<MeetingNote> notes = [];
-    if (existingJson != null) {
-      notes = (jsonDecode(existingJson) as List).map((e) => MeetingNote.fromJson(e)).toList();
-    }
-    int index = notes.indexWhere((n) => n.id == note.id);
-    if (index != -1) notes[index] = note; else notes.add(note);
-    await prefs.setString('meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
-  }
-
-  // AI 分析邏輯
-  Future<void> _processAiInBackground(MeetingNote note) async {
-    final prefs = await SharedPreferences.getInstance();
-    final apiKey = prefs.getString('api_key') ?? '';
-    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
-    // 直接從 GlobalManager 讀取字典
-    final List<String> vocabList = GlobalManager.vocabListNotifier.value;
-    
-    try {
-      if (apiKey.isEmpty) throw Exception("No API Key");
-      final model = GenerativeModel(model: modelName, apiKey: apiKey);
-      final audioBytes = await File(note.audioPath).readAsBytes();
-
-      // Prompt: 要求回傳包含 timestamp 的 JSON
-      String systemInstruction = """
-      你是一個會議記錄助理。
-      專有詞彙：${vocabList.join(', ')}。
-      
-      請分析音訊並回傳 JSON 格式 (不要 Markdown)：
-      {
-        "title": "會議標題",
-        "summary": "摘要",
-        "tasks": ["待辦1"],
-        "transcript": [
-           {"speaker": "A", "text": "大家好", "startTime": 0.5},
-           {"speaker": "B", "text": "開始報告", "startTime": 5.2}
-        ]
-      }
-      startTime 請使用秒數 (例如 12.5)。
-      """;
-
-      final response = await model.generateContent([
-        Content.multi([TextPart(systemInstruction), DataPart('audio/mp4', audioBytes)])
-      ]);
-
-      final jsonString = response.text!.replaceAll('```json', '').replaceAll('```', '').trim();
-      final Map<String, dynamic> result = jsonDecode(jsonString);
-
-      note.title = result['title'] ?? note.title;
-      note.summary = result['summary'] ?? '';
-      note.tasks = List<String>.from(result['tasks'] ?? []);
-      note.transcript = (result['transcript'] as List<dynamic>?)?.map((e) => TranscriptItem.fromJson(e)).toList() ?? [];
-      note.status = NoteStatus.success;
-
-      await _saveNoteToLocal(note);
-    } catch (e) {
-      print("AI Error: $e");
-      note.status = NoteStatus.failed;
-      note.summary = "分析失敗: $e";
-      await _saveNoteToLocal(note);
-    }
-  }
+  
+// --- 修改結束 ---
 
   @override
   Widget build(BuildContext context) {
@@ -445,12 +459,13 @@ class _HomePageState extends State<HomePage> {
                         if (note.status == NoteStatus.failed) const Text("分析失敗", style: TextStyle(color: Colors.red)),
                       ],
                     ),
+                    // --- 修改開始：HomePage 允許點擊任何狀態的筆記 ---
                     onTap: () {
-                      if (note.status == NoteStatus.success) {
-                        Navigator.push(context, MaterialPageRoute(builder: (_) => NoteDetailPage(note: note)))
-                            .then((_) => _loadNotes());
-                      }
+                      // 移除 if (note.status == NoteStatus.success) 的限制
+                      Navigator.push(context, MaterialPageRoute(builder: (_) => NoteDetailPage(note: note)))
+                          .then((_) => _loadNotes());
                     },
+                    // --- 修改結束 ---
                     // 右側：垃圾桶
                     trailing: note.isPinned
                         ? null // 置頂時不顯示刪除，或顯示 disabled
@@ -501,15 +516,11 @@ class _NoteDetailPageState extends State<NoteDetailPage> with SingleTickerProvid
     _tabController = TabController(length: 3, vsync: this);
     
     // --- 修正開始：改用新版 audioplayers 語法 ---
-    // 舊寫法 (會報錯): _audioPlayer.setSourceDeviceFile(_note.audioPath).then((_) async {
-    // 新寫法:
+    // 修正: 使用新的 audioplayers 語法
     _audioPlayer.setSource(DeviceFileSource(_note.audioPath)).then((_) async {
        final d = await _audioPlayer.getDuration();
        setState(() => _duration = d ?? Duration.zero);
-    }).catchError((e) {
-       print("音訊載入失敗: $e"); // 增加錯誤捕捉，避免紅屏
-    });
-    // --- 修正結束 ---
+    }).catchError((e) => print("音訊載入錯誤: $e"));
 
     _audioPlayer.onPlayerStateChanged.listen((state) {
       setState(() => _isPlaying = state == PlayerState.playing);
@@ -537,6 +548,22 @@ class _NoteDetailPageState extends State<NoteDetailPage> with SingleTickerProvid
     if (GlobalManager.isRecordingNotifier.value) return; // 錄音中禁止跳轉播放
     _audioPlayer.seek(Duration(milliseconds: (seconds * 1000).toInt()));
     _audioPlayer.resume();
+  }
+
+  // 新增：重試分析方法
+  Future<void> _retryAnalysis() async {
+    setState(() {
+      _note.status = NoteStatus.processing; // 立即更新 UI 為處理中
+    });
+    
+    await GlobalManager.analyzeNote(_note); // 呼叫全域分析
+    
+    setState(() {}); // 分析完成後刷新 UI
+  }
+
+  // 修改：使用 GlobalManager 儲存
+  Future<void> _saveNoteUpdate() async {
+    await GlobalManager.saveNote(_note);
   }
 
   // 進階編輯：包含斷句與框選加入字典
@@ -685,19 +712,6 @@ class _NoteDetailPageState extends State<NoteDetailPage> with SingleTickerProvid
     }
   }
 
-  Future<void> _saveNoteUpdate() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? notesJson = prefs.getString('meeting_notes');
-    if (notesJson != null) {
-      List<dynamic> decoded = jsonDecode(notesJson);
-      List<MeetingNote> allNotes = decoded.map((e) => MeetingNote.fromJson(e)).toList();
-      int idx = allNotes.indexWhere((n) => n.id == _note.id);
-      if (idx != -1) {
-        allNotes[idx] = _note;
-        await prefs.setString('meeting_notes', jsonEncode(allNotes.map((e) => e.toJson()).toList()));
-      }
-    }
-  }
 
   String _formatDuration(Duration d) => "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
 
@@ -707,7 +721,7 @@ class _NoteDetailPageState extends State<NoteDetailPage> with SingleTickerProvid
       appBar: AppBar(title: Text(_note.title)),
       body: Column(
         children: [
-          // 播放器
+          // 1. 播放器 (永遠顯示，即使分析失敗也能聽)
           Container(
             color: Colors.blueGrey[50],
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
@@ -735,55 +749,107 @@ class _NoteDetailPageState extends State<NoteDetailPage> with SingleTickerProvid
               ],
             ),
           ),
-          TabBar(
-            controller: _tabController,
-            labelColor: Colors.blue,
-            unselectedLabelColor: Colors.grey,
-            tabs: const [Tab(text: "逐字稿"), Tab(text: "摘要"), Tab(text: "任務")],
-          ),
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              children: [
-                // 逐字稿列表
-                ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: _note.transcript.length,
-                  itemBuilder: (context, index) {
-                    final item = _note.transcript[index];
-                    final bool isCurrent = _position.inSeconds >= item.startTime &&
-                        (index == _note.transcript.length - 1 || _position.inSeconds < _note.transcript[index + 1].startTime);
 
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: isCurrent ? Colors.blue[50] : Colors.white,
-                        border: isCurrent ? Border.all(color: Colors.blue) : null,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: ListTile(
-                        leading: GestureDetector(
-                          onTap: () => _changeSpeaker(index),
-                          child: CircleAvatar(
-                            backgroundColor: Colors.grey[300],
-                            child: Text(item.speaker[0], style: const TextStyle(fontSize: 12, color: Colors.black)),
+          // 2. 內容區 (根據狀態切換顯示)
+          Expanded(
+            child: Builder(builder: (context) {
+              // 狀態 A: 處理中
+              if (_note.status == NoteStatus.processing) {
+                 return const Center(child: Column(
+                   mainAxisAlignment: MainAxisAlignment.center,
+                   children: [
+                     CircularProgressIndicator(), 
+                     SizedBox(height: 16), 
+                     Text("AI 正在分析中...")
+                   ],
+                 ));
+              }
+              // 狀態 B: 失敗 (顯示重試按鈕)
+              if (_note.status == NoteStatus.failed) {
+                 return Center(child: Padding(
+                   padding: const EdgeInsets.all(24.0),
+                   child: Column(
+                     mainAxisAlignment: MainAxisAlignment.center,
+                     children: [
+                        const Icon(Icons.error_outline, size: 60, color: Colors.red),
+                        const SizedBox(height: 16),
+                        const Text("AI 分析失敗", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 8),
+                        Text("錯誤訊息: ${_note.summary}", textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey)),
+                        const SizedBox(height: 32),
+                        ElevatedButton.icon(
+                          onPressed: _retryAnalysis, // 綁定重試方法
+                          icon: const Icon(Icons.refresh),
+                          label: const Text("重新嘗試 AI 分析"),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue, 
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12)
                           ),
                         ),
-                        title: GestureDetector(
-                          onTap: () => _seekTo(item.startTime),
-                          onLongPress: () => _editTranscriptItem(index),
-                          child: Text(item.text),
+                        const SizedBox(height: 10),
+                        const Text("提示：若是 API Key 問題，請先至設定頁更換", style: TextStyle(fontSize: 12, color: Colors.grey))
+                     ],
+                   ),
+                 ));
+              }
+              // 狀態 C: 成功 (顯示原本的 Tabs)
+              return Column(
+                children: [
+                  TabBar(
+                    controller: _tabController,
+                    labelColor: Colors.blue,
+                    unselectedLabelColor: Colors.grey,
+                    tabs: const [Tab(text: "逐字稿"), Tab(text: "摘要"), Tab(text: "任務")],
+                  ),
+                  Expanded(
+                    child: TabBarView(
+                      controller: _tabController,
+                      children: [
+                        // 逐字稿列表 (保持原樣)
+                        ListView.builder(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: _note.transcript.length,
+                          itemBuilder: (context, index) {
+                            final item = _note.transcript[index];
+                            final bool isCurrent = _position.inSeconds >= item.startTime &&
+                                (index == _note.transcript.length - 1 || _position.inSeconds < _note.transcript[index + 1].startTime);
+
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 12),
+                              decoration: BoxDecoration(
+                                color: isCurrent ? Colors.blue[50] : Colors.white,
+                                border: isCurrent ? Border.all(color: Colors.blue) : null,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: ListTile(
+                                leading: GestureDetector(
+                                  onTap: () => _changeSpeaker(index),
+                                  child: CircleAvatar(
+                                    backgroundColor: Colors.grey[300],
+                                    child: Text(item.speaker[0], style: const TextStyle(fontSize: 12, color: Colors.black)),
+                                  ),
+                                ),
+                                title: GestureDetector(
+                                  onTap: () => _seekTo(item.startTime),
+                                  onLongPress: () => _editTranscriptItem(index),
+                                  child: Text(item.text),
+                                ),
+                                subtitle: Text(_formatDuration(Duration(seconds: item.startTime.toInt())), style: const TextStyle(fontSize: 10)),
+                              ),
+                            );
+                          },
                         ),
-                        subtitle: Text(_formatDuration(Duration(seconds: item.startTime.toInt())), style: const TextStyle(fontSize: 10)),
-                      ),
-                    );
-                  },
-                ),
-                // 摘要與任務 (簡單顯示)
-                SingleChildScrollView(padding: const EdgeInsets.all(16), child: Text(_note.summary, style: const TextStyle(fontSize: 16))),
-                ListView(children: _note.tasks.map((t) => ListTile(leading: const Icon(Icons.check_box_outline_blank), title: Text(t))).toList()),
-              ],
-            ),
+                        // 摘要 (保持原樣)
+                        SingleChildScrollView(padding: const EdgeInsets.all(16), child: Text(_note.summary, style: const TextStyle(fontSize: 16))),
+                        // 任務 (保持原樣)
+                        ListView(children: _note.tasks.map((t) => ListTile(leading: const Icon(Icons.check_box_outline_blank), title: Text(t))).toList()),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }),
           ),
         ],
       ),
@@ -806,9 +872,9 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _vocabController = TextEditingController();
   final TextEditingController _participantController = TextEditingController();
   
-  String _selectedModel = 'gemini-1.5-flash-latest';
+  String _selectedModel = 'gemini-flash-latest';
   List<String> _participantList = [];
-  final List<String> _models = ['gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'];
+  final List<String> _models = ['gemini-flash-latest', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-pro-latest', 'gemini-2.0-flash-exp'];
 
   @override
   void initState() {
@@ -820,7 +886,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
-      _selectedModel = prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
+      _selectedModel = prefs.getString('model_name') ?? 'gemini-flash-latest';
       _participantList = prefs.getStringList('participant_list') ?? [];
     });
   }
