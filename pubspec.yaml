@@ -28,13 +28,24 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  device_preview: ^1.1.0
   flutter:
     sdk: flutter
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-
+# 新增以下
+  google_generative_ai: ^0.4.0
+  record: ^6.0.0
+  path_provider: ^2.1.1
+  permission_handler: ^11.0.1
+  # 新增：資料儲存與格式化
+  shared_preferences: ^2.2.2
+  intl: ^0.20.2
+  uuid: ^4.3.3
+  # 新增：音訊播放器
+  audioplayers: ^6.0.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
