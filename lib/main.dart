@@ -156,6 +156,13 @@ class MeetingNote {
 }
 
 // --- 獨立的 REST API 處理類別 (修正網址與上傳邏輯) ---
+// --- 輔助 Log 函式 ---
+void _log(String message) {
+  // 這會顯示在您的終端機/除錯主控台中
+  print('📝 [GeminiDebug] $message');
+}
+
+// --- 獨立的 REST API 處理類別 (Debug 版) ---
 class GeminiRestApi {
   static const String _host = 'generativeai.googleapis.com';
 
@@ -166,10 +173,14 @@ class GeminiRestApi {
     String displayName,
   ) async {
     int fileSize = await file.length();
+    _log('準備上傳檔案: $displayName (大小: $fileSize bytes)');
 
     // 1. 建立初始上傳請求 (Resumable Upload)
-    // 注意：上傳的 path 必須包含 /upload/
-    final initUrl = Uri.https(_host, '/upload/v1beta/files', {'key': apiKey});
+    // 修正：加入 uploadType=resumable 參數
+    final initUrl = Uri.https(_host, '/upload/v1beta/files',
+        {'key': apiKey, 'uploadType': 'resumable'});
+
+    _log('Step 1: 初始化上傳 -> $initUrl');
 
     final initResponse = await http.post(
       initUrl,
@@ -180,12 +191,13 @@ class GeminiRestApi {
         'X-Goog-Upload-Header-Content-Type': mimeType,
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({
-        'file': {'display_name': displayName}
-      }),
+      // 修正：直接傳送屬性，不使用 file 包裝
+      body: jsonEncode({'display_name': displayName}),
     );
 
+    _log('Step 1 回應: ${initResponse.statusCode}');
     if (initResponse.statusCode != 200) {
+      _log('❌ 初始化失敗 Body: ${initResponse.body}');
       throw Exception(
           'Upload init failed (${initResponse.statusCode}): ${initResponse.body}');
     }
@@ -196,6 +208,7 @@ class GeminiRestApi {
       throw Exception('No upload URL returned from Google');
 
     // 2. 上傳實際檔案 bytes
+    _log('Step 2: 開始傳輸檔案內容...');
     final bytes = await file.readAsBytes();
     final uploadResponse = await http.put(
       Uri.parse(uploadUrlHeader),
@@ -207,28 +220,30 @@ class GeminiRestApi {
       body: bytes,
     );
 
+    _log('Step 2 回應: ${uploadResponse.statusCode}');
     if (uploadResponse.statusCode != 200) {
+      _log('❌ 檔案傳輸失敗 Body: ${uploadResponse.body}');
       throw Exception(
           'File upload failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
     }
 
-    // 回傳 file 物件資訊
-    return jsonDecode(uploadResponse.body)['file'];
+    final responseData = jsonDecode(uploadResponse.body);
+    _log('✅ 上傳成功! File Info: ${responseData['file']}');
+    return responseData['file'];
   }
 
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
-    // 查詢狀態的 path 不需要 /upload/
     final uri = Uri.https(_host, '/v1beta/files/$fileName', {'key': apiKey});
+    _log('檢查檔案狀態: $fileName');
 
     int retries = 0;
     while (retries < 60) {
-      // 最多等 2 分鐘
       final response = await http.get(uri);
       if (response.statusCode != 200)
-        throw Exception('Get file status failed: ${response.body}');
+        throw Exception('Get file failed: ${response.body}');
 
       final state = jsonDecode(response.body)['state'];
-      print("File state: $state");
+      _log('檔案狀態 ($retries): $state');
 
       if (state == 'ACTIVE') return;
       if (state == 'FAILED')
@@ -237,8 +252,7 @@ class GeminiRestApi {
       await Future.delayed(const Duration(seconds: 2));
       retries++;
     }
-    throw Exception(
-        'File processing timed out (still processing after 2 mins)');
+    throw Exception('File processing timed out');
   }
 
   static Future<String> generateContent(
@@ -248,9 +262,9 @@ class GeminiRestApi {
     String fileUri,
     String mimeType,
   ) async {
-    // 生成內容的 path
     final uri = Uri.https(
         _host, '/v1beta/models/$modelName:generateContent', {'key': apiKey});
+    _log('生成內容請求: $modelName');
 
     final response = await http.post(
       uri,
@@ -269,7 +283,9 @@ class GeminiRestApi {
       }),
     );
 
+    _log('生成內容回應: ${response.statusCode}');
     if (response.statusCode != 200) {
+      _log('❌ 生成失敗 Body: ${response.body}');
       throw Exception(
           'Generate content failed (${response.statusCode}): ${response.body}');
     }
@@ -384,8 +400,8 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    // 預設模型：若未設定則使用 gemini-1.5-flash
-    final modelName = prefs.getString('model_name') ?? 'gemini-1.5-flash';
+    final modelName =
+        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -393,40 +409,29 @@ class GlobalManager {
       if (apiKey.isEmpty) throw Exception("請先至設定頁面輸入 API Key");
 
       final audioFile = File(note.audioPath);
-      if (!await audioFile.exists())
-        throw Exception("找不到音訊檔案 (路徑: ${note.audioPath})");
+      if (!await audioFile.exists()) {
+        throw Exception("找不到音訊檔案: ${note.audioPath}\n(請確認是否有讀取權限)");
+      }
 
-      // 1. 上傳檔案 (REST API)
-      print("開始上傳檔案 (REST API)...");
+      // 1. 上傳檔案
+      _log("開始執行 analyzeNote 流程...");
       final fileInfo = await GeminiRestApi.uploadFile(
           apiKey, audioFile, 'audio/mp4', note.title);
 
       final String fileUri = fileInfo['uri'];
-      final String fileName =
-          fileInfo['name'].split('/').last; // 取得 files/ 後面的 ID
+      final String fileName = fileInfo['name'].split('/').last;
 
-      print("等待檔案處理: $fileName");
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
-      // 2. 第一階段：概覽分析
-      note.summary = ["AI 正在分析會議摘要 ($modelName)..."];
+      // 2. 概覽分析
+      note.summary = ["AI 正在分析會議摘要..."];
       await saveNote(note);
 
       String overviewPrompt = """
       你是一個專業的會議記錄助理。
       專有詞彙庫：${vocabList.join(', ')}。
       預設與會者名單：${participantList.join(', ')}。
-      
-      請分析整個音訊檔，並回傳純 JSON 格式 (不要 Markdown)。
-      你需要回傳以下欄位：
-      {
-        "title": "會議標題",
-        "summary": ["重點摘要1", "重點摘要2"],
-        "tasks": [{"description": "待辦事項", "assignee": "負責人", "dueDate": "YYYY-MM-DD"}],
-        "sections": [{"title": "議題一", "startTime": 0.0, "endTime": 120.0}],
-        "totalDuration": 300.0 (音訊總秒數，請務必精準估算)
-      }
-      注意：此階段「不需要」回傳 transcript (逐字稿)。
+      請分析音訊並回傳純 JSON 格式 (欄位: title, summary, tasks, sections, totalDuration)。
       """;
 
       final overviewResponseText = await GeminiRestApi.generateContent(
@@ -446,50 +451,33 @@ class GlobalManager {
       double totalDuration =
           (overviewJson['totalDuration'] ?? 600.0).toDouble();
 
-      // 3. 第二階段：分段逐字稿
+      // 3. 分段逐字稿
       List<TranscriptItem> fullTranscript = [];
       int chunkSizeMin = 10;
-      int chunkSeconds = chunkSizeMin * 60;
-      int totalChunks = (totalDuration / chunkSeconds).ceil();
+      int totalChunks = (totalDuration / (chunkSizeMin * 60)).ceil();
 
       for (int i = 0; i < totalChunks; i++) {
-        int startSec = i * chunkSeconds;
-        int endSec = (i + 1) * chunkSeconds;
-
         note.summary = [
           "正在生成逐字稿 (${i + 1}/$totalChunks)...",
-          ...List<String>.from(overviewJson['summary'] ?? []),
+          ...List<String>.from(overviewJson['summary'] ?? [])
         ];
         await saveNote(note);
 
-        String transcriptPrompt = """
-        請針對音訊檔的時間範圍： ${startSec}秒 到 ${endSec}秒。
-        提供詳細的「逐字稿」。
-        專有詞彙：${vocabList.join(', ')}。
-        與會者：${participantList.join(', ')}。
-        
-        請回傳純 JSON List 格式 (不要 Markdown)：
-        [
-          {"speaker": "名字", "text": "說話內容", "startTime": 123.5}
-        ]
-        如果這段時間沒有對話，回傳空陣列 []。
-        """;
+        String transcriptPrompt =
+            "請針對 ${i * 10} 分鐘 到 ${(i + 1) * 10} 分鐘 的內容，提供 JSON 格式的逐字稿 (欄位: speaker, text, startTime)。";
 
         try {
-          // 使用 REST API 呼叫，重複利用 fileUri
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
-
           final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
-          final chunkItems =
-              chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
-          fullTranscript.addAll(chunkItems);
+          fullTranscript.addAll(
+              chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
         } catch (e) {
-          print("Chunk $i failed: $e");
+          _log("Chunk $i Error: $e");
           fullTranscript.add(TranscriptItem(
               speaker: "System",
-              text: "[此段落分析失敗: $e]",
-              startTime: startSec.toDouble()));
+              text: "[此段落分析失敗]",
+              startTime: (i * 600).toDouble()));
         }
       }
 
@@ -497,9 +485,11 @@ class GlobalManager {
       note.summary = List<String>.from(overviewJson['summary'] ?? []);
       note.status = NoteStatus.success;
       await saveNote(note);
+      _log("分析流程完成！");
     } catch (e) {
-      print("Analysis Error: $e");
+      _log("分析流程嚴重錯誤: $e");
       note.status = NoteStatus.failed;
+      // 將錯誤訊息顯示在摘要中，方便您在手機上看到
       note.summary = ["分析失敗: $e"];
       await saveNote(note);
     }
