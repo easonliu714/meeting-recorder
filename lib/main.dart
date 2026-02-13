@@ -162,96 +162,104 @@ void _log(String message) {
   GlobalManager.addLog(message);
 }
 
-// --- 獨立的 REST API 處理類別 (Multipart 上傳版) ---
+// --- 獨立的 REST API 處理類別 (改用 Resumable Upload 增強穩定性) ---
 class GeminiRestApi {
   static const String _baseUrl = 'https://generativeai.googleapis.com';
 
-  /// 使用 Multipart 協議上傳 (單次請求，較穩定)
+  /// 使用 Resumable Upload 協議上傳 (兩階段上傳，解決 Broken pipe 問題)
   static Future<Map<String, dynamic>> uploadFile(
     String apiKey,
     File file,
     String mimeType,
     String displayName,
   ) async {
-    // 1. 準備網址 (改用 parse 避免參數編碼問題)
-    final url = Uri.parse(
-        '$_baseUrl/upload/v1beta/files?key=$apiKey&uploadType=multipart');
-
     int fileSize = await file.length();
-    _log('準備上傳 (Multipart): $displayName ($fileSize bytes)');
+    _log('準備上傳 (Resumable): $displayName ($fileSize bytes)');
 
-    // 2. 準備 Multipart Body
-    // 我們手動建構 Body 以確保格式完全符合 Google 要求 (multipart/related)
-    final boundary = '-------314159265358979323846'; // 自訂分隔符
-    final delimiter = '--$boundary\r\n';
-    final closeDelimiter = '--$boundary--\r\n';
+    // --- 第一步：初始化上傳，取得上傳網址 ---
+    // 官方文件: https://ai.google.dev/api/files#method:-media.upload
+    final initUrl = Uri.parse('$_baseUrl/upload/v1beta/files?key=$apiKey');
 
-    // Metadata 部分 (JSON)
     final metadata = jsonEncode({
       'file': {'display_name': displayName}
     });
 
-    // 檔案 Bytes
-    final fileBytes = await file.readAsBytes();
+    _log('Step 1: 初始化上傳請求...');
 
-    // 3. 組合請求內容
-    final bodyHeader = utf8.encode('$delimiter'
-        'Content-Type: application/json; charset=UTF-8\r\n\r\n'
-        '$metadata\r\n'
-        '$delimiter'
-        'Content-Type: $mimeType\r\n\r\n');
-
-    final bodyFooter = utf8.encode('\r\n$closeDelimiter');
-
-    // 合併所有 Bytes
-    final requestBody = <int>[
-      ...bodyHeader,
-      ...fileBytes,
-      ...bodyFooter,
-    ];
-
-    _log('開始發送請求...');
-
-    final response = await http.post(
-      url,
+    final initResponse = await http.post(
+      initUrl,
       headers: {
-        'Content-Type': 'multipart/related; boundary=$boundary',
-        'Content-Length': requestBody.length.toString(),
-        'X-Goog-Upload-Protocol': 'multipart', // 明確指定協議
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': fileSize.toString(),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
       },
-      body: requestBody,
+      body: metadata,
     );
 
-    _log('上傳回應代碼: ${response.statusCode}');
-
-    if (response.statusCode != 200) {
-      _log('❌ 上傳失敗 Body: ${response.body}');
-      throw Exception(
-          'Upload failed (${response.statusCode}): ${response.body}');
+    if (initResponse.statusCode != 200) {
+      _log('❌ 初始化失敗 (${initResponse.statusCode}): ${initResponse.body}');
+      throw Exception('Upload init failed: ${initResponse.body}');
     }
 
-    final responseData = jsonDecode(response.body);
+    // 從 Header 取得實際的上傳 URL
+    final uploadUrl = initResponse.headers['x-goog-upload-url'];
+    if (uploadUrl == null) {
+      throw Exception('Failed to retrieve upload URL from headers');
+    }
+
+    // --- 第二步：上傳實際檔案內容 ---
+    _log('Step 2: 開始傳送檔案資料...');
+
+    // 讀取檔案 Bytes
+    final fileBytes = await file.readAsBytes();
+
+    final uploadResponse = await http.put(
+      Uri.parse(uploadUrl),
+      headers: {
+        'Content-Length': fileSize.toString(),
+        'X-Goog-Upload-Offset': '0',
+        'X-Goog-Upload-Command': 'upload, finalize',
+      },
+      body: fileBytes,
+    );
+
+    _log('上傳回應代碼: ${uploadResponse.statusCode}');
+
+    if (uploadResponse.statusCode != 200) {
+      _log('❌ 傳送檔案失敗 Body: ${uploadResponse.body}');
+      throw Exception(
+          'File transfer failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
+    }
+
+    // 解析回傳結果
+    final responseData = jsonDecode(uploadResponse.body);
     _log('✅ 上傳成功! File URI: ${responseData['file']['uri']}');
     return responseData['file'];
   }
 
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
-    // 修正：查詢狀態的網址不含 /upload/
+    // 這裡保持不變，但建議確認 URL 不需要 /upload/
+    // 查詢狀態的 API 端點是: https://generativeai.googleapis.com/v1beta/files/...
     final url = Uri.parse('$_baseUrl/v1beta/files/$fileName?key=$apiKey');
     _log('檢查狀態: $fileName');
 
     int retries = 0;
     while (retries < 60) {
       final response = await http.get(url);
-      if (response.statusCode != 200)
+      if (response.statusCode != 200) {
+        _log('❌ 檢查狀態失敗: ${response.body}');
         throw Exception('Check status failed: ${response.body}');
+      }
 
       final state = jsonDecode(response.body)['state'];
       _log('檔案狀態 ($retries): $state');
 
       if (state == 'ACTIVE') return;
-      if (state == 'FAILED')
+      if (state == 'FAILED') {
         throw Exception('File processing failed (State: FAILED)');
+      }
 
       await Future.delayed(const Duration(seconds: 2));
       retries++;
@@ -266,8 +274,13 @@ class GeminiRestApi {
     String fileUri,
     String mimeType,
   ) async {
+    // 確保使用正確的模型名稱格式
+    // 如果使用者輸入 "gemini-1.5-flash"，API 通常需要 "models/gemini-1.5-flash"
+    // 但如果直接傳入 "models/..." 會導致 URL 變成 ".../models/models/..."，這裡假設使用者輸入純名稱
     final url = Uri.parse(
         '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
+
+    _log('發送 Prompt 至模型: $modelName');
 
     final response = await http.post(
       url,
@@ -296,6 +309,7 @@ class GeminiRestApi {
     try {
       return data['candidates'][0]['content']['parts'][0]['text'];
     } catch (e) {
+      _log('解析回應錯誤: $data');
       throw Exception('Unexpected response format: $data');
     }
   }
