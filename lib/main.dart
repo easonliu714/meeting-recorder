@@ -5,7 +5,8 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
+import 'package:http/http.dart' as http; // <--- 新增這行
+// import 'package:google_generative_ai/google_generative_ai.dart'; // 建議註解掉，改用純 HTTP
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -154,9 +155,9 @@ class MeetingNote {
       );
 }
 
-// --- 獨立的 API 處理類別 (強化錯誤顯示) ---
+// --- 獨立的 REST API 處理類別 (修正網址與上傳邏輯) ---
 class GeminiRestApi {
-  static const String _baseUrl = 'https://generativeai.googleapis.com';
+  static const String _host = 'generativeai.googleapis.com';
 
   static Future<Map<String, dynamic>> uploadFile(
     String apiKey,
@@ -166,7 +167,10 @@ class GeminiRestApi {
   ) async {
     int fileSize = await file.length();
 
-    final initUrl = Uri.parse('$_baseUrl/upload/v1beta/files?key=$apiKey');
+    // 1. 建立初始上傳請求 (Resumable Upload)
+    // 注意：上傳的 path 必須包含 /upload/
+    final initUrl = Uri.https(_host, '/upload/v1beta/files', {'key': apiKey});
+
     final initResponse = await http.post(
       initUrl,
       headers: {
@@ -182,17 +186,19 @@ class GeminiRestApi {
     );
 
     if (initResponse.statusCode != 200) {
-      // 顯示詳細錯誤 Body
       throw Exception(
           'Upload init failed (${initResponse.statusCode}): ${initResponse.body}');
     }
 
-    final uploadUrl = initResponse.headers['x-goog-upload-url'];
-    if (uploadUrl == null) throw Exception('No upload URL returned');
+    // 取得實際的上傳網址
+    final uploadUrlHeader = initResponse.headers['x-goog-upload-url'];
+    if (uploadUrlHeader == null)
+      throw Exception('No upload URL returned from Google');
 
+    // 2. 上傳實際檔案 bytes
     final bytes = await file.readAsBytes();
     final uploadResponse = await http.put(
-      Uri.parse(uploadUrl),
+      Uri.parse(uploadUrlHeader),
       headers: {
         'Content-Length': fileSize.toString(),
         'X-Goog-Upload-Offset': '0',
@@ -206,18 +212,24 @@ class GeminiRestApi {
           'File upload failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
     }
 
+    // 回傳 file 物件資訊
     return jsonDecode(uploadResponse.body)['file'];
   }
 
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
-    final uri = Uri.parse('$_baseUrl/v1beta/files/$fileName?key=$apiKey');
+    // 查詢狀態的 path 不需要 /upload/
+    final uri = Uri.https(_host, '/v1beta/files/$fileName', {'key': apiKey});
+
     int retries = 0;
     while (retries < 60) {
+      // 最多等 2 分鐘
       final response = await http.get(uri);
       if (response.statusCode != 200)
-        throw Exception('Get file failed: ${response.body}');
+        throw Exception('Get file status failed: ${response.body}');
 
       final state = jsonDecode(response.body)['state'];
+      print("File state: $state");
+
       if (state == 'ACTIVE') return;
       if (state == 'FAILED')
         throw Exception('File processing failed state: $state');
@@ -225,7 +237,8 @@ class GeminiRestApi {
       await Future.delayed(const Duration(seconds: 2));
       retries++;
     }
-    throw Exception('File processing timed out');
+    throw Exception(
+        'File processing timed out (still processing after 2 mins)');
   }
 
   static Future<String> generateContent(
@@ -235,8 +248,10 @@ class GeminiRestApi {
     String fileUri,
     String mimeType,
   ) async {
-    final uri = Uri.parse(
-        '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
+    // 生成內容的 path
+    final uri = Uri.https(
+        _host, '/v1beta/models/$modelName:generateContent', {'key': apiKey});
+
     final response = await http.post(
       uri,
       headers: {'Content-Type': 'application/json'},
@@ -255,7 +270,6 @@ class GeminiRestApi {
     );
 
     if (response.statusCode != 200) {
-      // 顯示詳細錯誤 Body (這是 debug 最關鍵的一步)
       throw Exception(
           'Generate content failed (${response.statusCode}): ${response.body}');
     }
@@ -362,6 +376,7 @@ class GlobalManager {
     }
   }
 
+// --- AI 分析 (修正：使用 GeminiRestApi 避免 SDK 版本問題與 404) ---
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.summary = ["準備上傳檔案..."];
@@ -369,9 +384,8 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    // 預設模型修正：如果未設定，使用 gemini-1.5-flash-latest (較為穩定的名稱)
-    // 但保留您的設定，若設定為 gemini-flash-latest 則使用該值
-    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
+    // 預設模型：若未設定則使用 gemini-1.5-flash
+    final modelName = prefs.getString('model_name') ?? 'gemini-1.5-flash';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -382,16 +396,19 @@ class GlobalManager {
       if (!await audioFile.exists())
         throw Exception("找不到音訊檔案 (路徑: ${note.audioPath})");
 
-      print("開始上傳檔案 (Rest API)...");
+      // 1. 上傳檔案 (REST API)
+      print("開始上傳檔案 (REST API)...");
       final fileInfo = await GeminiRestApi.uploadFile(
           apiKey, audioFile, 'audio/mp4', note.title);
 
       final String fileUri = fileInfo['uri'];
-      final String fileName = fileInfo['name'].split('/').last;
+      final String fileName =
+          fileInfo['name'].split('/').last; // 取得 files/ 後面的 ID
 
       print("等待檔案處理: $fileName");
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
+      // 2. 第一階段：概覽分析
       note.summary = ["AI 正在分析會議摘要 ($modelName)..."];
       await saveNote(note);
 
@@ -429,6 +446,7 @@ class GlobalManager {
       double totalDuration =
           (overviewJson['totalDuration'] ?? 600.0).toDouble();
 
+      // 3. 第二階段：分段逐字稿
       List<TranscriptItem> fullTranscript = [];
       int chunkSizeMin = 10;
       int chunkSeconds = chunkSizeMin * 60;
@@ -458,6 +476,7 @@ class GlobalManager {
         """;
 
         try {
+          // 使用 REST API 呼叫，重複利用 fileUri
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
 
@@ -467,13 +486,10 @@ class GlobalManager {
           fullTranscript.addAll(chunkItems);
         } catch (e) {
           print("Chunk $i failed: $e");
-          fullTranscript.add(
-            TranscriptItem(
+          fullTranscript.add(TranscriptItem(
               speaker: "System",
-              text: "[此段落分析失敗: $e]", // 這裡會顯示具體的 API 錯誤
-              startTime: startSec.toDouble(),
-            ),
-          );
+              text: "[此段落分析失敗: $e]",
+              startTime: startSec.toDouble()));
         }
       }
 
@@ -484,7 +500,7 @@ class GlobalManager {
     } catch (e) {
       print("Analysis Error: $e");
       note.status = NoteStatus.failed;
-      note.summary = ["分析失敗: $e"]; // 錯誤訊息會顯示在 App 列表摘要中
+      note.summary = ["分析失敗: $e"];
       await saveNote(note);
     }
   }
