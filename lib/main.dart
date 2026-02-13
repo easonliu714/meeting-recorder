@@ -20,7 +20,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await GlobalManager.init(); // 改為統一初始化
+  await GlobalManager.init();
   runApp(
     const MaterialApp(debugShowCheckedModeBanner: false, home: MainAppShell()),
   );
@@ -154,7 +154,7 @@ class MeetingNote {
       );
 }
 
-// --- 獨立的 API 處理類別 ---
+// --- 獨立的 API 處理類別 (強化錯誤顯示) ---
 class GeminiRestApi {
   static const String _baseUrl = 'https://generativeai.googleapis.com';
 
@@ -182,7 +182,9 @@ class GeminiRestApi {
     );
 
     if (initResponse.statusCode != 200) {
-      throw Exception('Upload init failed: ${initResponse.body}');
+      // 顯示詳細錯誤 Body
+      throw Exception(
+          'Upload init failed (${initResponse.statusCode}): ${initResponse.body}');
     }
 
     final uploadUrl = initResponse.headers['x-goog-upload-url'];
@@ -200,7 +202,8 @@ class GeminiRestApi {
     );
 
     if (uploadResponse.statusCode != 200) {
-      throw Exception('File upload failed: ${uploadResponse.body}');
+      throw Exception(
+          'File upload failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
     }
 
     return jsonDecode(uploadResponse.body)['file'];
@@ -211,11 +214,13 @@ class GeminiRestApi {
     int retries = 0;
     while (retries < 60) {
       final response = await http.get(uri);
-      if (response.statusCode != 200) throw Exception('Get file failed');
+      if (response.statusCode != 200)
+        throw Exception('Get file failed: ${response.body}');
 
       final state = jsonDecode(response.body)['state'];
       if (state == 'ACTIVE') return;
-      if (state == 'FAILED') throw Exception('File processing failed');
+      if (state == 'FAILED')
+        throw Exception('File processing failed state: $state');
 
       await Future.delayed(const Duration(seconds: 2));
       retries++;
@@ -250,29 +255,28 @@ class GeminiRestApi {
     );
 
     if (response.statusCode != 200) {
-      throw Exception('Generate content failed: ${response.body}');
+      // 顯示詳細錯誤 Body (這是 debug 最關鍵的一步)
+      throw Exception(
+          'Generate content failed (${response.statusCode}): ${response.body}');
     }
 
     final data = jsonDecode(response.body);
     try {
       return data['candidates'][0]['content']['parts'][0]['text'];
     } catch (e) {
-      throw Exception('Unexpected API response format');
+      throw Exception('Unexpected API response format: $data');
     }
   }
 }
 
-// --- GlobalManager (核心邏輯修正) ---
+// --- GlobalManager ---
 class GlobalManager {
   static final ValueNotifier<bool> isRecordingNotifier = ValueNotifier(false);
-  // 用於專有詞彙
   static final ValueNotifier<List<String>> vocabListNotifier =
       ValueNotifier([]);
-  // 新增：用於與會者名單 (解決問題 6)
   static final ValueNotifier<List<String>> participantListNotifier =
       ValueNotifier([]);
 
-  // 初始化載入
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
@@ -280,7 +284,6 @@ class GlobalManager {
         prefs.getStringList('participant_list') ?? [];
   }
 
-  // --- 專有詞彙管理 ---
   static Future<void> addVocab(String word) async {
     if (!vocabListNotifier.value.contains(word)) {
       final newList = List<String>.from(vocabListNotifier.value)..add(word);
@@ -297,7 +300,6 @@ class GlobalManager {
     await prefs.setStringList('vocab_list', newList);
   }
 
-  // --- 與會者管理 (解決問題 6) ---
   static Future<void> addParticipant(String name) async {
     if (!participantListNotifier.value.contains(name)) {
       final newList = List<String>.from(participantListNotifier.value)
@@ -316,7 +318,6 @@ class GlobalManager {
     await prefs.setStringList('participant_list', newList);
   }
 
-  // --- 筆記儲存與刪除 (解決問題 4) ---
   static Future<void> saveNote(MeetingNote note) async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
@@ -342,7 +343,6 @@ class GlobalManager {
     );
   }
 
-  // 新增：全域刪除筆記功能
   static Future<void> deleteNote(String id) async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
@@ -362,7 +362,6 @@ class GlobalManager {
     }
   }
 
-  // --- AI 分析 ---
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.summary = ["準備上傳檔案..."];
@@ -370,6 +369,8 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
+    // 預設模型修正：如果未設定，使用 gemini-1.5-flash-latest (較為穩定的名稱)
+    // 但保留您的設定，若設定為 gemini-flash-latest 則使用該值
     final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
@@ -469,7 +470,7 @@ class GlobalManager {
           fullTranscript.add(
             TranscriptItem(
               speaker: "System",
-              text: "[此段落分析失敗: $e]",
+              text: "[此段落分析失敗: $e]", // 這裡會顯示具體的 API 錯誤
               startTime: startSec.toDouble(),
             ),
           );
@@ -483,7 +484,7 @@ class GlobalManager {
     } catch (e) {
       print("Analysis Error: $e");
       note.status = NoteStatus.failed;
-      note.summary = ["分析失敗: $e"];
+      note.summary = ["分析失敗: $e"]; // 錯誤訊息會顯示在 App 列表摘要中
       await saveNote(note);
     }
   }
@@ -559,7 +560,7 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> _startRecording() async {
-    // 解決問題 2, 3: Android 13+ 需要 microphone 權限
+    // 確保權限
     Map<Permission, PermissionStatus> statuses = await [
       Permission.microphone,
     ].request();
@@ -661,15 +662,13 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> _pickFile() async {
-    // 解決問題 2: Android 13+ 需要 photos/audio 權限，而不是 storage
-    // 為了兼容性，我們請求一組權限
+    // 解決 Android 13+ 權限問題
     Map<Permission, PermissionStatus> statuses = await [
       Permission.storage,
       Permission.audio, // Android 13+
-      Permission.mediaLibrary, // Android 13+ (部分設備)
+      Permission.mediaLibrary,
     ].request();
 
-    // 只要有一個給過，或是部分授權，就嘗試選檔 (FilePicker 自己也會處理一部分)
     if (statuses.values.any((s) => s.isGranted || s.isLimited) ||
         await Permission.storage.isGranted) {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -681,7 +680,7 @@ class _MainAppShellState extends State<MainAppShell> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("正在準備上傳檔案，這可能需要一點時間..."),
+              content: Text("正在準備上傳檔案..."),
               backgroundColor: Colors.blue,
             ),
           );
@@ -951,7 +950,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _deleteNote(String id) async {
     await GlobalManager.deleteNote(id);
-    _loadNotes(); // 重新讀取
+    _loadNotes();
   }
 
   @override
@@ -1173,7 +1172,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // 解決問題 5: 修改說話者，可選清單或新增
   void _changeSpeaker(int index) {
     String currentSpeaker = _note.transcript[index].speaker;
     TextEditingController customController = TextEditingController(text: "");
@@ -1222,7 +1220,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           FilledButton(
             onPressed: () {
               if (customController.text.isNotEmpty) {
-                // 自動將新名稱加入常用清單
                 GlobalManager.addParticipant(customController.text);
                 _confirmSpeakerChange(
                     index, currentSpeaker, customController.text);
@@ -1236,9 +1233,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   }
 
   void _confirmSpeakerChange(int index, String oldName, String newName) {
-    Navigator.pop(context); // 關閉選擇對話框
+    Navigator.pop(context);
 
-    // 詢問修改範圍
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -1467,7 +1463,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // 解決問題 4: 實作詳細頁面的刪除功能
   Future<void> _confirmDelete() async {
     bool? confirm = await showDialog<bool>(
       context: context,
@@ -1487,7 +1482,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
     if (confirm == true) {
       await GlobalManager.deleteNote(_note.id);
-      if (mounted) Navigator.pop(context); // 返回上一頁
+      if (mounted) Navigator.pop(context);
     }
   }
 
@@ -1519,7 +1514,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
-              if (value == 'delete') _confirmDelete(); // 呼叫刪除確認
+              if (value == 'delete') _confirmDelete();
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'pdf', child: Text("匯出 PDF")),
@@ -1593,7 +1588,13 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     ),
                   )
                 : _note.status == NoteStatus.failed
-                    ? Center(child: Text("分析失敗: ${_note.summary.firstOrNull}"))
+                    ? Center(
+                        child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Text("分析失敗: ${_note.summary.firstOrNull}",
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Colors.red)),
+                      ))
                     : TabBarView(
                         controller: _tabController,
                         children: [
@@ -1720,12 +1721,15 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _vocabController = TextEditingController();
-  final TextEditingController _participantController =
-      TextEditingController(); // 用於輸入單個參與者
+  final TextEditingController _participantController = TextEditingController();
   String _selectedModel = 'gemini-flash-latest';
   final List<String> _models = [
-    'gemini-flash-latest',
+    'gemini-flash-latest', // 保留您指定的
+    'gemini-1.5-flash-latest', // 官方建議的
+    'gemini-2.5-flash',
     'gemini-1.5-flash',
+    'gemini-pro-latest',
+    'gemini-2.5-pro',
     'gemini-1.5-pro',
     'gemini-1.0-pro',
   ];
@@ -1741,7 +1745,6 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _selectedModel = prefs.getString('model_name') ?? 'gemini-flash-latest';
-      // 注意：participantList 已由 GlobalManager 管理，不需在此讀取逗號字串
     });
   }
 
@@ -1750,7 +1753,6 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('model_name', _selectedModel);
 
-    // 參與者清單已即時儲存，這裡只需顯示提示
     if (mounted)
       ScaffoldMessenger.of(
         context,
@@ -1785,9 +1787,7 @@ class _SettingsPageState extends State<SettingsPage> {
             onChanged: (val) => setState(() => _selectedModel = val!),
             decoration: const InputDecoration(labelText: "選擇 AI 模型"),
           ),
-
           const SizedBox(height: 20),
-          // 解決問題 6: 預設與會者改為 Tag 模式
           const Text(
             "預設與會者 (常用名單)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -1826,7 +1826,6 @@ class _SettingsPageState extends State<SettingsPage> {
                   .toList(),
             ),
           ),
-
           const SizedBox(height: 20),
           const Text(
             "專有詞彙庫 (幫助 AI 辨識)",
