@@ -14,7 +14,7 @@ dependencies:
   device_preview: ^1.1.0
   cupertino_icons: ^1.0.8
 
-  # AI 核心 (關鍵修改 1：務必改為 ^0.4.6 以支援大檔案上傳)
+  # AI 核心
   google_generative_ai: ^0.4.6 
 
   # 錄音與播放
@@ -28,11 +28,10 @@ dependencies:
   file_picker: ^8.0.0
   
   # 工具
-  # (關鍵修改 2：改回 0.20.2 以配合您的 Flutter 環境)
   intl: ^0.20.2             
   uuid: ^4.3.3
   share_plus: ^10.0.0
-  http: ^1.6.0
+  http: ^1.2.0
 
   # PDF 與列印
   pdf: ^3.10.0
@@ -45,3 +44,15 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # 新增：用於生成 APP ICON
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+
+# 新增：ICON 設定 (請確保 assets/app_icon.png 存在，或修改 image_path)
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: false                 # 修改：關閉 iOS 生成，避免報錯
+  image_path: "web/icons/Icon-512.png" # 修改：直接使用您專案中現有的圖片，不用另外上傳 assets
+  min_sdk_android: 21

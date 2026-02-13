@@ -5,7 +5,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http; // 必須引入 http
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -20,7 +20,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await GlobalManager.loadVocab();
+  await GlobalManager.init(); // 改為統一初始化
   runApp(
     const MaterialApp(debugShowCheckedModeBanner: false, home: MainAppShell()),
   );
@@ -154,11 +154,10 @@ class MeetingNote {
       );
 }
 
-// --- 獨立的 API 處理類別 (繞過 SDK 限制) ---
+// --- 獨立的 API 處理類別 ---
 class GeminiRestApi {
   static const String _baseUrl = 'https://generativeai.googleapis.com';
 
-  /// 執行 Resumable Upload 協議上傳大檔案
   static Future<Map<String, dynamic>> uploadFile(
     String apiKey,
     File file,
@@ -167,7 +166,6 @@ class GeminiRestApi {
   ) async {
     int fileSize = await file.length();
 
-    // 1. 初始請求，取得上傳 URL
     final initUrl = Uri.parse('$_baseUrl/upload/v1beta/files?key=$apiKey');
     final initResponse = await http.post(
       initUrl,
@@ -190,7 +188,6 @@ class GeminiRestApi {
     final uploadUrl = initResponse.headers['x-goog-upload-url'];
     if (uploadUrl == null) throw Exception('No upload URL returned');
 
-    // 2. 上傳實際檔案 bytes
     final bytes = await file.readAsBytes();
     final uploadResponse = await http.put(
       Uri.parse(uploadUrl),
@@ -206,16 +203,13 @@ class GeminiRestApi {
       throw Exception('File upload failed: ${uploadResponse.body}');
     }
 
-    // 回傳 file 物件資訊
     return jsonDecode(uploadResponse.body)['file'];
   }
 
-  /// 輪詢檔案狀態直到 ACTIVE
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
     final uri = Uri.parse('$_baseUrl/v1beta/files/$fileName?key=$apiKey');
     int retries = 0;
     while (retries < 60) {
-      // 最多等 2 分鐘
       final response = await http.get(uri);
       if (response.statusCode != 200) throw Exception('Get file failed');
 
@@ -229,7 +223,6 @@ class GeminiRestApi {
     throw Exception('File processing timed out');
   }
 
-  /// 呼叫 Generate Content (支援 File API URI)
   static Future<String> generateContent(
     String apiKey,
     String modelName,
@@ -260,7 +253,6 @@ class GeminiRestApi {
       throw Exception('Generate content failed: ${response.body}');
     }
 
-    // 解析回應
     final data = jsonDecode(response.body);
     try {
       return data['candidates'][0]['content']['parts'][0]['text'];
@@ -270,18 +262,25 @@ class GeminiRestApi {
   }
 }
 
-// --- GlobalManager (修正為使用 HTTP 直接呼叫) ---
+// --- GlobalManager (核心邏輯修正) ---
 class GlobalManager {
   static final ValueNotifier<bool> isRecordingNotifier = ValueNotifier(false);
-  static final ValueNotifier<List<String>> vocabListNotifier = ValueNotifier(
-    [],
-  );
+  // 用於專有詞彙
+  static final ValueNotifier<List<String>> vocabListNotifier =
+      ValueNotifier([]);
+  // 新增：用於與會者名單 (解決問題 6)
+  static final ValueNotifier<List<String>> participantListNotifier =
+      ValueNotifier([]);
 
-  static Future<void> loadVocab() async {
+  // 初始化載入
+  static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
+    participantListNotifier.value =
+        prefs.getStringList('participant_list') ?? [];
   }
 
+  // --- 專有詞彙管理 ---
   static Future<void> addVocab(String word) async {
     if (!vocabListNotifier.value.contains(word)) {
       final newList = List<String>.from(vocabListNotifier.value)..add(word);
@@ -298,6 +297,26 @@ class GlobalManager {
     await prefs.setStringList('vocab_list', newList);
   }
 
+  // --- 與會者管理 (解決問題 6) ---
+  static Future<void> addParticipant(String name) async {
+    if (!participantListNotifier.value.contains(name)) {
+      final newList = List<String>.from(participantListNotifier.value)
+        ..add(name);
+      participantListNotifier.value = newList;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList('participant_list', newList);
+    }
+  }
+
+  static Future<void> removeParticipant(String name) async {
+    final newList = List<String>.from(participantListNotifier.value)
+      ..remove(name);
+    participantListNotifier.value = newList;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('participant_list', newList);
+  }
+
+  // --- 筆記儲存與刪除 (解決問題 4) ---
   static Future<void> saveNote(MeetingNote note) async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
@@ -323,7 +342,27 @@ class GlobalManager {
     );
   }
 
-  /// 核心分析邏輯：手動 HTTP 上傳 -> 概覽分析 -> 分段逐字稿
+  // 新增：全域刪除筆記功能
+  static Future<void> deleteNote(String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? existingJson = prefs.getString('meeting_notes');
+    if (existingJson != null) {
+      try {
+        List<MeetingNote> notes = (jsonDecode(existingJson) as List)
+            .map((e) => MeetingNote.fromJson(e))
+            .toList();
+        notes.removeWhere((n) => n.id == id);
+        await prefs.setString(
+          'meeting_notes',
+          jsonEncode(notes.map((e) => e.toJson()).toList()),
+        );
+      } catch (e) {
+        print("Error deleting note: $e");
+      }
+    }
+  }
+
+  // --- AI 分析 ---
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.summary = ["準備上傳檔案..."];
@@ -333,34 +372,26 @@ class GlobalManager {
     final apiKey = prefs.getString('api_key') ?? '';
     final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
-    final List<String> participantList =
-        prefs.getStringList('participant_list') ?? [];
+    final List<String> participantList = participantListNotifier.value;
 
     try {
       if (apiKey.isEmpty) throw Exception("請先至設定頁面輸入 API Key");
 
       final audioFile = File(note.audioPath);
-      if (!await audioFile.exists()) throw Exception("找不到音訊檔案");
+      if (!await audioFile.exists())
+        throw Exception("找不到音訊檔案 (路徑: ${note.audioPath})");
 
-      // 1. 上傳檔案 (使用手動實作的 RestApi)
       print("開始上傳檔案 (Rest API)...");
       final fileInfo = await GeminiRestApi.uploadFile(
-          apiKey,
-          audioFile,
-          'audio/mp4', // 假設是 m4a/mp4
-          note.title);
+          apiKey, audioFile, 'audio/mp4', note.title);
 
       final String fileUri = fileInfo['uri'];
       final String fileName = fileInfo['name'].split('/').last;
 
-      // 等待檔案處理
       print("等待檔案處理: $fileName");
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
-      // -----------------------------------------------------------------
-      // 第一階段：取得概覽
-      // -----------------------------------------------------------------
-      note.summary = ["AI 正在分析會議摘要..."];
+      note.summary = ["AI 正在分析會議摘要 ($modelName)..."];
       await saveNote(note);
 
       String overviewPrompt = """
@@ -384,7 +415,6 @@ class GlobalManager {
           apiKey, modelName, overviewPrompt, fileUri, 'audio/mp4');
       final overviewJson = _parseJson(overviewResponseText);
 
-      // 更新 Note 的概覽資訊
       note.title = overviewJson['title'] ?? note.title;
       note.summary = List<String>.from(overviewJson['summary'] ?? []);
       note.tasks = (overviewJson['tasks'] as List<dynamic>?)
@@ -398,9 +428,6 @@ class GlobalManager {
       double totalDuration =
           (overviewJson['totalDuration'] ?? 600.0).toDouble();
 
-      // -----------------------------------------------------------------
-      // 第二階段：分段取得逐字稿
-      // -----------------------------------------------------------------
       List<TranscriptItem> fullTranscript = [];
       int chunkSizeMin = 10;
       int chunkSeconds = chunkSizeMin * 60;
@@ -430,7 +457,6 @@ class GlobalManager {
         """;
 
         try {
-          // 使用 Rest API 呼叫，傳入相同的 fileUri (不需重複上傳)
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
 
@@ -533,7 +559,12 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> _startRecording() async {
-    if (await Permission.microphone.request().isGranted) {
+    // 解決問題 2, 3: Android 13+ 需要 microphone 權限
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.microphone,
+    ].request();
+
+    if (statuses[Permission.microphone]!.isGranted) {
       final dir = await getApplicationDocumentsDirectory();
       final fileName =
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$_recordingPart.m4a";
@@ -569,7 +600,7 @@ class _MainAppShellState extends State<MainAppShell> {
       if (mounted)
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(const SnackBar(content: Text("需要麥克風權限")));
+        ).showSnackBar(const SnackBar(content: Text("需要麥克風權限才能錄音")));
     }
   }
 
@@ -630,31 +661,48 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> _pickFile() async {
-    await Permission.storage.request();
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.audio,
-    );
-    if (result != null) {
-      File file = File(result.files.single.path!);
+    // 解決問題 2: Android 13+ 需要 photos/audio 權限，而不是 storage
+    // 為了兼容性，我們請求一組權限
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.storage,
+      Permission.audio, // Android 13+
+      Permission.mediaLibrary, // Android 13+ (部分設備)
+    ].request();
 
-      // 注意：使用 File API 後，20MB 限制已解除，但上傳仍需時間
+    // 只要有一個給過，或是部分授權，就嘗試選檔 (FilePicker 自己也會處理一部分)
+    if (statuses.values.any((s) => s.isGranted || s.isLimited) ||
+        await Permission.storage.isGranted) {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.audio,
+      );
+      if (result != null) {
+        File file = File(result.files.single.path!);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("正在準備上傳檔案，這可能需要一點時間..."),
+              backgroundColor: Colors.blue,
+            ),
+          );
+        }
+
+        DateTime fileDate = DateTime.now();
+        try {
+          fileDate = await file.lastModified();
+        } catch (e) {
+          print("無法取得檔案時間: $e");
+        }
+
+        _createNewNoteAndAnalyze(file.path, "匯入錄音", date: fileDate);
+      }
+    } else {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text("正在準備上傳檔案，這可能需要一點時間..."),
-            backgroundColor: Colors.blue,
-          ),
+              content: Text("需要存取檔案權限"), backgroundColor: Colors.red),
         );
       }
-
-      DateTime fileDate = DateTime.now();
-      try {
-        fileDate = await file.lastModified();
-      } catch (e) {
-        print("無法取得檔案時間: $e");
-      }
-
-      _createNewNoteAndAnalyze(file.path, "匯入錄音", date: fileDate);
     }
   }
 
@@ -861,15 +909,6 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 }
 
-// ... 以下 HomePage, NoteDetailPage, SettingsPage 請保持原樣 ...
-// (為避免篇幅過長，這裡省略後面的 UI 代碼，請直接沿用上一版即可，因為那些部分完全不需要修改)
-// 但請確保在您的檔案中保留它們的定義！
-// ==========================================
-// 請在這裡貼上 HomePage, NoteDetailPage, SettingsPage 的完整程式碼
-// ==========================================
-// 為了讓這段程式碼能直接執行，我會在下方補上這三個類別的精簡參考，
-// 您只需將前一個版本的後半段 (HomePage 以後) 貼過來即可。
-
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -911,12 +950,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _deleteNote(String id) async {
-    setState(() => _notes.removeWhere((note) => note.id == id));
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      'meeting_notes',
-      jsonEncode(_notes.map((e) => e.toJson()).toList()),
-    );
+    await GlobalManager.deleteNote(id);
+    _loadNotes(); // 重新讀取
   }
 
   @override
@@ -1138,38 +1173,82 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
+  // 解決問題 5: 修改說話者，可選清單或新增
   void _changeSpeaker(int index) {
     String currentSpeaker = _note.transcript[index].speaker;
-    TextEditingController controller = TextEditingController(
-      text: currentSpeaker,
-    );
+    TextEditingController customController = TextEditingController(text: "");
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text("修改說話者"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: controller,
-              decoration: const InputDecoration(labelText: "輸入新名稱"),
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              "請選擇修改範圍：",
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ],
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("選擇既有與會者:",
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              ValueListenableBuilder<List<String>>(
+                valueListenable: GlobalManager.participantListNotifier,
+                builder: (context, participants, child) {
+                  return Wrap(
+                    spacing: 8,
+                    children: participants.map((name) {
+                      return ActionChip(
+                        label: Text(name),
+                        onPressed: () =>
+                            _confirmSpeakerChange(index, currentSpeaker, name),
+                      );
+                    }).toList(),
+                  );
+                },
+              ),
+              const Divider(height: 20),
+              const Text("或輸入新名稱:",
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              TextField(
+                controller: customController,
+                decoration: const InputDecoration(labelText: "新名稱"),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text("取消"),
           ),
+          FilledButton(
+            onPressed: () {
+              if (customController.text.isNotEmpty) {
+                // 自動將新名稱加入常用清單
+                GlobalManager.addParticipant(customController.text);
+                _confirmSpeakerChange(
+                    index, currentSpeaker, customController.text);
+              }
+            },
+            child: const Text("確定"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmSpeakerChange(int index, String oldName, String newName) {
+    Navigator.pop(context); // 關閉選擇對話框
+
+    // 詢問修改範圍
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text("確認修改為 $newName"),
+        content: const Text("請選擇修改範圍："),
+        actions: [
           TextButton(
             onPressed: () {
               setState(() {
-                _note.transcript[index].speaker = controller.text;
+                _note.transcript[index].speaker = newName;
               });
               _saveNoteUpdate();
               Navigator.pop(context);
@@ -1178,10 +1257,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           ),
           FilledButton(
             onPressed: () {
-              String newName = controller.text;
               setState(() {
                 for (var item in _note.transcript) {
-                  if (item.speaker == currentSpeaker) {
+                  if (item.speaker == oldName) {
                     item.speaker = newName;
                   }
                 }
@@ -1389,6 +1467,30 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
+  // 解決問題 4: 實作詳細頁面的刪除功能
+  Future<void> _confirmDelete() async {
+    bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("確定要刪除嗎？"),
+        content: const Text("此操作無法復原。"),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text("取消")),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text("刪除", style: TextStyle(color: Colors.red))),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await GlobalManager.deleteNote(_note.id);
+      if (mounted) Navigator.pop(context); // 返回上一頁
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1417,9 +1519,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
-              if (value == 'delete') {
-                /* 刪除邏輯略 */
-              }
+              if (value == 'delete') _confirmDelete(); // 呼叫刪除確認
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'pdf', child: Text("匯出 PDF")),
@@ -1620,11 +1720,11 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _vocabController = TextEditingController();
-  final TextEditingController _participantController = TextEditingController();
+  final TextEditingController _participantController =
+      TextEditingController(); // 用於輸入單個參與者
   String _selectedModel = 'gemini-flash-latest';
   final List<String> _models = [
     'gemini-flash-latest',
-    'gemini-pro-latest',
     'gemini-1.5-flash',
     'gemini-1.5-pro',
     'gemini-1.0-pro',
@@ -1641,8 +1741,7 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _selectedModel = prefs.getString('model_name') ?? 'gemini-flash-latest';
-      _participantController.text =
-          (prefs.getStringList('participant_list') ?? []).join(', ');
+      // 注意：participantList 已由 GlobalManager 管理，不需在此讀取逗號字串
     });
   }
 
@@ -1651,13 +1750,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('model_name', _selectedModel);
 
-    List<String> participants = _participantController.text
-        .split(',')
-        .map((e) => e.trim())
-        .where((e) => e.isNotEmpty)
-        .toList();
-    await prefs.setStringList('participant_list', participants);
-
+    // 參與者清單已即時儲存，這裡只需顯示提示
     if (mounted)
       ScaffoldMessenger.of(
         context,
@@ -1692,15 +1785,48 @@ class _SettingsPageState extends State<SettingsPage> {
             onChanged: (val) => setState(() => _selectedModel = val!),
             decoration: const InputDecoration(labelText: "選擇 AI 模型"),
           ),
+
           const SizedBox(height: 20),
+          // 解決問題 6: 預設與會者改為 Tag 模式
           const Text(
-            "預設與會者 (用逗號分隔)",
+            "預設與會者 (常用名單)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
-          TextField(
-            controller: _participantController,
-            decoration: const InputDecoration(labelText: "例如: 小明, 小華, 經理"),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _participantController,
+                  decoration: const InputDecoration(hintText: "輸入姓名 (如: 小明)"),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.add),
+                onPressed: () {
+                  if (_participantController.text.isNotEmpty) {
+                    GlobalManager.addParticipant(_participantController.text);
+                    _participantController.clear();
+                    setState(() {});
+                  }
+                },
+              ),
+            ],
           ),
+          ValueListenableBuilder<List<String>>(
+            valueListenable: GlobalManager.participantListNotifier,
+            builder: (ctx, list, _) => Wrap(
+              spacing: 8,
+              children: list
+                  .map(
+                    (name) => Chip(
+                      label: Text(name),
+                      onDeleted: () => GlobalManager.removeParticipant(name),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+
           const SizedBox(height: 20),
           const Text(
             "專有詞彙庫 (幫助 AI 辨識)",
