@@ -162,97 +162,101 @@ void _log(String message) {
   GlobalManager.addLog(message);
 }
 
-// --- 獨立的 REST API 處理類別 (Debug 版) ---
+// --- 獨立的 REST API 處理類別 (Multipart 上傳版) ---
 class GeminiRestApi {
-  static const String _host = 'generativeai.googleapis.com';
+  static const String _baseUrl = 'https://generativeai.googleapis.com';
 
+  /// 使用 Multipart 協議上傳 (單次請求，較穩定)
   static Future<Map<String, dynamic>> uploadFile(
     String apiKey,
     File file,
     String mimeType,
     String displayName,
   ) async {
+    // 1. 準備網址 (改用 parse 避免參數編碼問題)
+    final url = Uri.parse(
+        '$_baseUrl/upload/v1beta/files?key=$apiKey&uploadType=multipart');
+
     int fileSize = await file.length();
-    _log('準備上傳檔案: $displayName (大小: $fileSize bytes)');
+    _log('準備上傳 (Multipart): $displayName ($fileSize bytes)');
 
-    // 1. 建立初始上傳請求 (Resumable Upload)
-    // 修正：加入 uploadType=resumable 參數
-    final initUrl = Uri.https(_host, '/upload/v1beta/files',
-        {'key': apiKey, 'uploadType': 'resumable'});
+    // 2. 準備 Multipart Body
+    // 我們手動建構 Body 以確保格式完全符合 Google 要求 (multipart/related)
+    final boundary = '-------314159265358979323846'; // 自訂分隔符
+    final delimiter = '--$boundary\r\n';
+    final closeDelimiter = '--$boundary--\r\n';
 
-    _log('Step 1: 初始化上傳 -> $initUrl');
+    // Metadata 部分 (JSON)
+    final metadata = jsonEncode({
+      'file': {'display_name': displayName}
+    });
 
-    final initResponse = await http.post(
-      initUrl,
+    // 檔案 Bytes
+    final fileBytes = await file.readAsBytes();
+
+    // 3. 組合請求內容
+    final bodyHeader = utf8.encode('$delimiter'
+        'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+        '$metadata\r\n'
+        '$delimiter'
+        'Content-Type: $mimeType\r\n\r\n');
+
+    final bodyFooter = utf8.encode('\r\n$closeDelimiter');
+
+    // 合併所有 Bytes
+    final requestBody = <int>[
+      ...bodyHeader,
+      ...fileBytes,
+      ...bodyFooter,
+    ];
+
+    _log('開始發送請求...');
+
+    final response = await http.post(
+      url,
       headers: {
-        'X-Goog-Upload-Protocol': 'resumable',
-        'X-Goog-Upload-Command': 'start',
-        'X-Goog-Upload-Header-Content-Length': fileSize.toString(),
-        'X-Goog-Upload-Header-Content-Type': mimeType,
-        'Content-Type': 'application/json',
+        'Content-Type': 'multipart/related; boundary=$boundary',
+        'Content-Length': requestBody.length.toString(),
+        'X-Goog-Upload-Protocol': 'multipart', // 明確指定協議
       },
-      // 修正：直接傳送屬性，不使用 file 包裝
-      body: jsonEncode({'display_name': displayName}),
+      body: requestBody,
     );
 
-    _log('Step 1 回應: ${initResponse.statusCode}');
-    if (initResponse.statusCode != 200) {
-      _log('❌ 初始化失敗 Body: ${initResponse.body}');
+    _log('上傳回應代碼: ${response.statusCode}');
+
+    if (response.statusCode != 200) {
+      _log('❌ 上傳失敗 Body: ${response.body}');
       throw Exception(
-          'Upload init failed (${initResponse.statusCode}): ${initResponse.body}');
+          'Upload failed (${response.statusCode}): ${response.body}');
     }
 
-    // 取得實際的上傳網址
-    final uploadUrlHeader = initResponse.headers['x-goog-upload-url'];
-    if (uploadUrlHeader == null)
-      throw Exception('No upload URL returned from Google');
-
-    // 2. 上傳實際檔案 bytes
-    _log('Step 2: 開始傳輸檔案內容...');
-    final bytes = await file.readAsBytes();
-    final uploadResponse = await http.put(
-      Uri.parse(uploadUrlHeader),
-      headers: {
-        'Content-Length': fileSize.toString(),
-        'X-Goog-Upload-Offset': '0',
-        'X-Goog-Upload-Command': 'upload, finalize',
-      },
-      body: bytes,
-    );
-
-    _log('Step 2 回應: ${uploadResponse.statusCode}');
-    if (uploadResponse.statusCode != 200) {
-      _log('❌ 檔案傳輸失敗 Body: ${uploadResponse.body}');
-      throw Exception(
-          'File upload failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
-    }
-
-    final responseData = jsonDecode(uploadResponse.body);
-    _log('✅ 上傳成功! File Info: ${responseData['file']}');
+    final responseData = jsonDecode(response.body);
+    _log('✅ 上傳成功! File URI: ${responseData['file']['uri']}');
     return responseData['file'];
   }
 
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
-    final uri = Uri.https(_host, '/v1beta/files/$fileName', {'key': apiKey});
-    _log('檢查檔案狀態: $fileName');
+    // 修正：查詢狀態的網址不含 /upload/
+    final url = Uri.parse('$_baseUrl/v1beta/files/$fileName?key=$apiKey');
+    _log('檢查狀態: $fileName');
 
     int retries = 0;
     while (retries < 60) {
-      final response = await http.get(uri);
+      final response = await http.get(url);
       if (response.statusCode != 200)
-        throw Exception('Get file failed: ${response.body}');
+        throw Exception('Check status failed: ${response.body}');
 
       final state = jsonDecode(response.body)['state'];
       _log('檔案狀態 ($retries): $state');
 
       if (state == 'ACTIVE') return;
       if (state == 'FAILED')
-        throw Exception('File processing failed state: $state');
+        throw Exception('File processing failed (State: FAILED)');
 
       await Future.delayed(const Duration(seconds: 2));
       retries++;
     }
-    throw Exception('File processing timed out');
+    throw Exception('Timeout waiting for file to become ACTIVE');
   }
 
   static Future<String> generateContent(
@@ -262,12 +266,11 @@ class GeminiRestApi {
     String fileUri,
     String mimeType,
   ) async {
-    final uri = Uri.https(
-        _host, '/v1beta/models/$modelName:generateContent', {'key': apiKey});
-    _log('生成內容請求: $modelName');
+    final url = Uri.parse(
+        '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
 
     final response = await http.post(
-      uri,
+      url,
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
         'contents': [
@@ -283,9 +286,8 @@ class GeminiRestApi {
       }),
     );
 
-    _log('生成內容回應: ${response.statusCode}');
     if (response.statusCode != 200) {
-      _log('❌ 生成失敗 Body: ${response.body}');
+      _log('❌ 生成內容失敗: ${response.body}');
       throw Exception(
           'Generate content failed (${response.statusCode}): ${response.body}');
     }
@@ -294,7 +296,7 @@ class GeminiRestApi {
     try {
       return data['candidates'][0]['content']['parts'][0]['text'];
     } catch (e) {
-      throw Exception('Unexpected API response format: $data');
+      throw Exception('Unexpected response format: $data');
     }
   }
 }
@@ -430,15 +432,16 @@ class GlobalManager {
 
       final audioFile = File(note.audioPath);
       if (!await audioFile.exists()) {
-        throw Exception("找不到音訊檔案: ${note.audioPath}\n(請確認是否有讀取權限)");
+        throw Exception("找不到音訊檔案: ${note.audioPath}");
       }
 
-      // 1. 上傳檔案
-      _log("開始執行 analyzeNote 流程...");
+      // 1. 上傳檔案 (Multipart)
+      _log("執行 analyzeNote: 開始 Multipart 上傳...");
       final fileInfo = await GeminiRestApi.uploadFile(
           apiKey, audioFile, 'audio/mp4', note.title);
 
       final String fileUri = fileInfo['uri'];
+      // 從 name 欄位 "files/abc-123" 取得 "abc-123"
       final String fileName = fileInfo['name'].split('/').last;
 
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
@@ -451,7 +454,8 @@ class GlobalManager {
       你是一個專業的會議記錄助理。
       專有詞彙庫：${vocabList.join(', ')}。
       預設與會者名單：${participantList.join(', ')}。
-      請分析音訊並回傳純 JSON 格式 (欄位: title, summary, tasks, sections, totalDuration)。
+      請分析音訊並回傳純 JSON 格式 (不要 Markdown)。
+      欄位包含: title, summary (字串陣列), tasks (陣列), sections (陣列), totalDuration (秒數, 數值)。
       """;
 
       final overviewResponseText = await GeminiRestApi.generateContent(
@@ -493,7 +497,7 @@ class GlobalManager {
           fullTranscript.addAll(
               chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
         } catch (e) {
-          _log("Chunk $i Error: $e");
+          _log("分段 $i 分析失敗: $e");
           fullTranscript.add(TranscriptItem(
               speaker: "System",
               text: "[此段落分析失敗]",
@@ -505,11 +509,10 @@ class GlobalManager {
       note.summary = List<String>.from(overviewJson['summary'] ?? []);
       note.status = NoteStatus.success;
       await saveNote(note);
-      _log("分析流程完成！");
+      _log("分析完成！");
     } catch (e) {
-      _log("分析流程嚴重錯誤: $e");
+      _log("分析流程錯誤: $e");
       note.status = NoteStatus.failed;
-      // 將錯誤訊息顯示在摘要中，方便您在手機上看到
       note.summary = ["分析失敗: $e"];
       await saveNote(note);
     }
