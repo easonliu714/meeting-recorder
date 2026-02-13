@@ -156,10 +156,10 @@ class MeetingNote {
 }
 
 // --- 獨立的 REST API 處理類別 (修正網址與上傳邏輯) ---
-// --- 輔助 Log 函式 ---
+// --- 輔助 Log 函式 (修改版) ---
 void _log(String message) {
-  // 這會顯示在您的終端機/除錯主控台中
-  print('📝 [GeminiDebug] $message');
+  // 將訊息存入 GlobalManager 讓手機畫面可以顯示
+  GlobalManager.addLog(message);
 }
 
 // --- 獨立的 REST API 處理類別 (Debug 版) ---
@@ -306,7 +306,27 @@ class GlobalManager {
       ValueNotifier([]);
   static final ValueNotifier<List<String>> participantListNotifier =
       ValueNotifier([]);
+  // --- 新增：日誌儲存空間 ---
+  static final ValueNotifier<List<String>> logsNotifier = ValueNotifier([]);
+// 新增：寫入日誌的方法 (微調格式)
+  static void addLog(String message) {
+    final time = DateFormat('HH:mm:ss').format(DateTime.now());
+    // 增加 [APP] 標籤，讓日誌更清晰
+    final newLog = "[$time] [APP] $message";
 
+    // 更新列表 (加入到最前面，最新的在上面)
+    // 限制日誌長度，避免記憶體爆掉 (保留最近 500 行)
+    final currentLogs = logsNotifier.value;
+    if (currentLogs.length > 500) {
+      logsNotifier.value = [newLog, ...currentLogs.take(499)];
+    } else {
+      logsNotifier.value = [newLog, ...currentLogs];
+    }
+
+    print(newLog); // 終端機也印一份
+  }
+
+  // -----------------------
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
@@ -1768,7 +1788,21 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("設定")),
+      appBar: AppBar(
+        title: const Text("設定"),
+        // 新增：右上角增加日誌按鈕
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.bug_report, color: Colors.red),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const LogViewerPage()),
+              );
+            },
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -1880,6 +1914,104 @@ class _SettingsPageState extends State<SettingsPage> {
             child: const Text("儲存所有設定"),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// --- 新增：日誌檢視頁面 (增強版：加入分享功能) ---
+class LogViewerPage extends StatelessWidget {
+  const LogViewerPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("系統日誌 (Debug)"),
+        actions: [
+          // 1. 清除按鈕
+          IconButton(
+            icon: const Icon(Icons.delete),
+            onPressed: () {
+              GlobalManager.logsNotifier.value = []; // 清空日誌
+            },
+          ),
+          // 2. 分享按鈕 (新增功能)
+          IconButton(
+            icon: const Icon(Icons.share),
+            onPressed: () async {
+              try {
+                final text = GlobalManager.logsNotifier.value.join('\n');
+                if (text.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("沒有日誌可分享")),
+                  );
+                  return;
+                }
+
+                // 取得暫存目錄
+                final dir = await getTemporaryDirectory();
+                final file = File('${dir.path}/app_debug_log.txt');
+
+                // 寫入檔案
+                await file.writeAsString(text);
+
+                // 呼叫系統分享
+                await Share.shareXFiles([XFile(file.path)],
+                    text: 'Meeting Recorder Debug Log');
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text("匯出失敗: $e")),
+                );
+              }
+            },
+          ),
+          // 3. 複製按鈕
+          IconButton(
+            icon: const Icon(Icons.copy),
+            onPressed: () {
+              final text = GlobalManager.logsNotifier.value.join('\n');
+              Clipboard.setData(ClipboardData(text: text));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("日誌已複製到剪貼簿")),
+              );
+            },
+          ),
+        ],
+      ),
+      backgroundColor: Colors.black, // 黑底更有工程師感
+      body: ValueListenableBuilder<List<String>>(
+        valueListenable: GlobalManager.logsNotifier,
+        builder: (context, logs, child) {
+          if (logs.isEmpty) {
+            return const Center(
+                child: Text("尚無日誌", style: TextStyle(color: Colors.white)));
+          }
+          return ListView.separated(
+            padding: const EdgeInsets.all(8),
+            itemCount: logs.length,
+            separatorBuilder: (_, __) =>
+                const Divider(color: Colors.white24, height: 1),
+            itemBuilder: (context, index) {
+              final log = logs[index];
+              Color textColor = Colors.greenAccent; // 一般訊息顏色
+              if (log.contains("❌") ||
+                  log.contains("失敗") ||
+                  log.contains("Error") ||
+                  log.contains("Exception")) {
+                textColor = Colors.redAccent; // 錯誤訊息顏色
+              } else if (log.contains("Step") || log.contains("準備")) {
+                textColor = Colors.yellowAccent; // 步驟顏色
+              }
+
+              return SelectableText(
+                log,
+                style: TextStyle(
+                    color: textColor, fontFamily: 'monospace', fontSize: 12),
+              );
+            },
+          );
+        },
       ),
     );
   }
