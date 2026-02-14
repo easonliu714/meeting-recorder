@@ -162,11 +162,12 @@ void _log(String message) {
   GlobalManager.addLog(message);
 }
 
-// --- 獨立的 REST API 處理類別 (改用 Resumable Upload 增強穩定性) ---
+// --- 獨立的 REST API 處理類別 (修正網址與 Resumable Upload) ---
 class GeminiRestApi {
-  static const String _baseUrl = 'https://generativeai.googleapis.com';
+  // 修正：使用正確的 API 網址
+  static const String _baseUrl = 'https://generativelanguage.googleapis.com';
 
-  /// 使用 Resumable Upload 協議上傳 (兩階段上傳，解決 Broken pipe 問題)
+  /// 使用 Resumable Upload 協議上傳
   static Future<Map<String, dynamic>> uploadFile(
     String apiKey,
     File file,
@@ -176,9 +177,10 @@ class GeminiRestApi {
     int fileSize = await file.length();
     _log('準備上傳 (Resumable): $displayName ($fileSize bytes)');
 
-    // --- 第一步：初始化上傳，取得上傳網址 ---
-    // 官方文件: https://ai.google.dev/api/files#method:-media.upload
-    final initUrl = Uri.parse('$_baseUrl/upload/v1beta/files?key=$apiKey');
+    // 1. 初始化上傳
+    // 修正：加入 uploadType=resumable 參數，確保伺服器知道這是續傳請求
+    final initUrl = Uri.parse(
+        '$_baseUrl/upload/v1beta/files?key=$apiKey&uploadType=resumable');
 
     final metadata = jsonEncode({
       'file': {'display_name': displayName}
@@ -209,10 +211,9 @@ class GeminiRestApi {
       throw Exception('Failed to retrieve upload URL from headers');
     }
 
-    // --- 第二步：上傳實際檔案內容 ---
+    // 2. 上傳實際檔案內容
     _log('Step 2: 開始傳送檔案資料...');
 
-    // 讀取檔案 Bytes
     final fileBytes = await file.readAsBytes();
 
     final uploadResponse = await http.put(
@@ -225,23 +226,19 @@ class GeminiRestApi {
       body: fileBytes,
     );
 
-    _log('上傳回應代碼: ${uploadResponse.statusCode}');
-
     if (uploadResponse.statusCode != 200) {
-      _log('❌ 傳送檔案失敗 Body: ${uploadResponse.body}');
+      _log('❌ 傳送檔案失敗 (${uploadResponse.statusCode}): ${uploadResponse.body}');
       throw Exception(
           'File transfer failed (${uploadResponse.statusCode}): ${uploadResponse.body}');
     }
 
-    // 解析回傳結果
     final responseData = jsonDecode(uploadResponse.body);
     _log('✅ 上傳成功! File URI: ${responseData['file']['uri']}');
     return responseData['file'];
   }
 
   static Future<void> waitForFileActive(String apiKey, String fileName) async {
-    // 這裡保持不變，但建議確認 URL 不需要 /upload/
-    // 查詢狀態的 API 端點是: https://generativeai.googleapis.com/v1beta/files/...
+    // 修正：查詢狀態的網址也需要改為 _baseUrl (generativelanguage)
     final url = Uri.parse('$_baseUrl/v1beta/files/$fileName?key=$apiKey');
     _log('檢查狀態: $fileName');
 
@@ -274,9 +271,7 @@ class GeminiRestApi {
     String fileUri,
     String mimeType,
   ) async {
-    // 確保使用正確的模型名稱格式
-    // 如果使用者輸入 "gemini-1.5-flash"，API 通常需要 "models/gemini-1.5-flash"
-    // 但如果直接傳入 "models/..." 會導致 URL 變成 ".../models/models/..."，這裡假設使用者輸入純名稱
+    // 確保這裡使用正確的 _baseUrl
     final url = Uri.parse(
         '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
 
@@ -558,8 +553,9 @@ class GlobalManager {
     try {
       final result = jsonDecode(cleanText);
       if (result is List) return result;
-      if (result is Map && result.containsKey('transcript'))
+      if (result is Map && result.containsKey('transcript')) {
         return result['transcript'];
+      }
       return [];
     } catch (e) {
       return [];
@@ -641,10 +637,11 @@ class _MainAppShellState extends State<MainAppShell> {
 
       GlobalManager.isRecordingNotifier.value = true;
     } else {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text("需要麥克風權限才能錄音")));
+      }
     }
   }
 
@@ -1422,14 +1419,17 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     md.writeln("日期: ${DateFormat('yyyy/MM/dd HH:mm').format(_note.date)}\n");
 
     md.writeln("## 📝 重點摘要");
-    for (var s in _note.summary) md.writeln("- $s");
+    for (var s in _note.summary) {
+      md.writeln("- $s");
+    }
     md.writeln("");
 
     md.writeln("## ✅ 待辦事項");
     md.writeln("| 任務 | 負責人 | 期限 |");
     md.writeln("|---|---|---|");
-    for (var t in _note.tasks)
+    for (var t in _note.tasks) {
       md.writeln("| ${t.description} | ${t.assignee} | ${t.dueDate} |");
+    }
     md.writeln("");
 
     md.writeln("## 💬 逐字稿");
@@ -1796,10 +1796,11 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('model_name', _selectedModel);
 
-    if (mounted)
+    if (mounted) {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text("設定已儲存")));
+    }
   }
 
   @override
@@ -1837,7 +1838,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 10),
           DropdownButtonFormField<String>(
-            value: _selectedModel,
+            initialValue: _selectedModel,
             items: _models
                 .map((m) => DropdownMenuItem(value: m, child: Text(m)))
                 .toList(),
