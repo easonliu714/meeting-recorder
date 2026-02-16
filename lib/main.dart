@@ -5,8 +5,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http; // <--- 新增這行
-// import 'package:google_generative_ai/google_generative_ai.dart'; // 建議註解掉，改用純 HTTP
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -129,7 +128,7 @@ class MeetingNote {
   List<Section> sections;
   NoteStatus status;
   bool isPinned;
-  String currentStep; // 新增：紀錄當前處理進度文字
+  String currentStep; // 紀錄當前處理進度文字
 
   MeetingNote({
     required this.id,
@@ -285,73 +284,120 @@ class GeminiRestApi {
   ) async {
     final url = Uri.parse(
         '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
-    _log('發送 Prompt 至模型: $modelName');
 
-    final response = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'contents': [
-          {
-            'parts': [
-              {'text': prompt},
-              {
-                'file_data': {'mime_type': mimeType, 'file_uri': fileUri}
-              }
-            ]
-          }
-        ],
-        'generationConfig': {'responseMimeType': 'application/json'}
-      }),
-    );
+    int retryCount = 0;
+    int maxRetries = 5; // 增加最高重試次數
 
-    if (response.statusCode != 200) {
-      throw Exception('Generate content failed: ${response.body}');
-    }
+    while (true) {
+      if (retryCount == 0) _log('發送 Prompt 至模型: $modelName');
 
-    try {
-      return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
-          ['text'];
-    } catch (e) {
-      throw Exception('Unexpected response format: ${response.body}');
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'contents': [
+            {
+              'parts': [
+                {'text': prompt},
+                {
+                  'file_data': {'mime_type': mimeType, 'file_uri': fileUri}
+                }
+              ]
+            }
+          ],
+          'generationConfig': {'responseMimeType': 'application/json'}
+        }),
+      );
+
+      // --- 核心修改：智慧擷取 Google 要求的等待時間並自動重試 ---
+      if (response.statusCode == 429 && retryCount < maxRetries) {
+        double waitSeconds = 20.0;
+        // 透過正規表達式精準抓出 "retry in 47.5s." 的數字
+        final match =
+            RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
+        if (match != null && match.group(1) != null) {
+          waitSeconds = double.parse(match.group(1)!) + 3.0; // 多加 3 秒緩衝，確保解鎖
+        } else {
+          waitSeconds = 20.0 * (retryCount + 1); // 備用機制
+        }
+        _log(
+            "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
+        await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+        retryCount++;
+        continue; // 重新執行 while 迴圈發送請求
+      }
+
+      if (response.statusCode != 200) {
+        throw Exception('Generate content failed: ${response.body}');
+      }
+
+      try {
+        return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
+            ['text'];
+      } catch (e) {
+        throw Exception('Unexpected response format: ${response.body}');
+      }
     }
   }
 
-  // --- 新增：純文字分析 (用於基於修改後逐字稿重新摘要) ---
+  // --- 純文字分析 (用於基於修改後逐字稿重新摘要) ---
   static Future<String> generateTextOnly(
       String apiKey, String modelName, String prompt) async {
     final url = Uri.parse(
         '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
-    _log('發送純文字 Prompt 至模型: $modelName');
 
-    final response = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'contents': [
-          {
-            'parts': [
-              {'text': prompt}
-            ]
-          }
-        ],
-        'generationConfig': {'responseMimeType': 'application/json'}
-      }),
-    );
+    int retryCount = 0;
+    int maxRetries = 5;
 
-    if (response.statusCode != 200) {
-      throw Exception('Generate text failed: ${response.body}');
-    }
+    while (true) {
+      if (retryCount == 0) _log('發送純文字 Prompt 至模型: $modelName');
 
-    try {
-      return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
-          ['text'];
-    } catch (e) {
-      throw Exception('Unexpected response format: ${response.body}');
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'contents': [
+            {
+              'parts': [
+                {'text': prompt}
+              ]
+            }
+          ],
+          'generationConfig': {'responseMimeType': 'application/json'}
+        }),
+      );
+
+      // --- 核心修改：智慧擷取 Google 要求的等待時間並自動重試 ---
+      if (response.statusCode == 429 && retryCount < maxRetries) {
+        double waitSeconds = 20.0;
+        final match =
+            RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
+        if (match != null && match.group(1) != null) {
+          waitSeconds = double.parse(match.group(1)!) + 3.0;
+        } else {
+          waitSeconds = 20.0 * (retryCount + 1);
+        }
+        _log(
+            "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
+        await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+        retryCount++;
+        continue;
+      }
+
+      if (response.statusCode != 200) {
+        throw Exception('Generate text failed: ${response.body}');
+      }
+
+      try {
+        return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
+            ['text'];
+      } catch (e) {
+        throw Exception('Unexpected response format: ${response.body}');
+      }
     }
   }
 
-  // --- 新增：測試 API Key 並取得可用模型清單 ---
+  // --- 測試 API Key 並取得可用模型清單 ---
   static Future<List<String>> getAvailableModels(String apiKey) async {
     final url = Uri.parse('$_baseUrl/v1beta/models?key=$apiKey');
     _log('正在測試 API Key 並獲取模型清單...');
@@ -388,7 +434,7 @@ class GlobalManager {
       ValueNotifier([]);
   static final ValueNotifier<List<String>> logsNotifier = ValueNotifier([]);
 
-  // --- 新增：用於即時更新首頁列表的推播器 ---
+  // --- 用於即時更新首頁列表的推播器 ---
   static final ValueNotifier<List<MeetingNote>> notesNotifier =
       ValueNotifier([]);
 
@@ -410,7 +456,7 @@ class GlobalManager {
     await loadNotes(); // 初始化時自動載入一次筆記
   }
 
-  // --- 新增：將載入筆記獨立出來，並更新 Notifier ---
+  // --- 將載入筆記獨立出來，並更新 Notifier ---
   static Future<void> loadNotes() async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
@@ -484,7 +530,7 @@ class GlobalManager {
     await prefs.setString(
         'meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
 
-    // --- 新增：每次存檔完自動刷新 Notifier ---
+    // --- 每次存檔完自動刷新 Notifier ---
     await loadNotes();
   }
 
@@ -499,7 +545,7 @@ class GlobalManager {
       await prefs.setString(
           'meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
 
-      // --- 新增：每次刪除完自動刷新 Notifier ---
+      // --- 每次刪除完自動刷新 Notifier ---
       await loadNotes();
     }
   }
@@ -613,42 +659,33 @@ class GlobalManager {
         ⚠️ 致命陷阱警告：當說話者 A 提到 B 的名字，或是 A 在模仿 B 講話時，說話者依然是 A！絕對不可因為聽到 B 的名字，就誤判為 B 在發言。
         
         【多語系與翻譯規則】(極重要)：
-        1. 若對話中夾雜「非中文單字/詞彙」，請保留原文，並緊接著在後方用括號附上繁體中文翻譯。
-           - 範例：「這個 project (專案) 的 schedule (時程) 要再確認。」
-        2. 若「整句話」都是非中文（如全英文、全日文對話），請先打出原文，接著換行並加上繁體中文翻譯。
-           - 範例：「We need to double check the data.\\n(我們需要再次核對這些數據。)」
+        1. 若對話中僅夾雜「非中文單字/詞彙」，請保留原文，並在後方用括號附上繁體中文翻譯。範例：「這個 project (專案) 要確認。」
+        2. 若「整句話」都是非中文（如全日文、全韓文、全英文），請務必嚴格依照以下「三行格式」輸出，不要省略任何一行：
+           [原文] {外語原本的文字，如日文漢字/假名、韓文諺文等}
+           [拼音] {對應的羅馬拼音 (Romaji/Pinyin) 或發音提示}
+           [翻譯] {繁體中文翻譯}
+           (範例)：
+           [原文] 本当にありがとうございます
+           [拼音] Hontou ni arigatou gozaimasu
+           [翻譯] 真的非常感謝
 
         回傳純 JSON 陣列格式範例：
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
         """;
 
-        // --- 核心修改：加入 Retry 迴圈對抗 429 頻率限制 ---
-        int retryCount = 0;
-        bool chunkSuccess = false;
-
-        while (retryCount < 3 && !chunkSuccess) {
-          try {
-            final chunkResponseText = await GeminiRestApi.generateContent(
-                apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
-            final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
-            fullTranscript.addAll(
-                chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
-            chunkSuccess = true; // 成功解析，跳出重試迴圈
-          } catch (e) {
-            _log("分段 $i 分析失敗 (第 ${retryCount + 1} 次): $e");
-            if (e.toString().contains('429')) {
-              _log("⚠️ API 請求頻率限制，等待 15 秒後重試...");
-              await Future.delayed(const Duration(seconds: 15)); // 強制等待配額恢復
-              retryCount++;
-            } else {
-              break; // 其它非頻率限制的錯誤，直接放棄此段
-            }
-          }
+        // --- 核心修改：移除舊版寫死的迴圈，現在由 GeminiRestApi 智慧處理重試 ---
+        try {
+          final chunkResponseText = await GeminiRestApi.generateContent(
+              apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
+          final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
+          fullTranscript.addAll(
+              chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
+        } catch (e) {
+          _log("分段 $i 最終分析失敗: $e");
+          // 遇到非 429 的嚴重錯誤，或超過 5 次重試依然失敗，紀錄後繼續處理下一段，不讓整筆中斷
         }
 
-        if (!chunkSuccess) _log("分段 $i 最終放棄分析");
-        // ---------------------------------------------------
-
+        // 基本的預防性延遲
         if (i < totalChunks - 1) {
           await Future.delayed(const Duration(seconds: 4));
         }
@@ -1094,7 +1131,7 @@ class _MainAppShellState extends State<MainAppShell> {
     }
   }
 
-// --- 新增：底部彈出選單 (錄音/匯入選項) ---
+// --- 底部彈出選單 (錄音/匯入選項) ---
   void showAddMenu() {
     showModalBottomSheet(
       context: context,
@@ -1261,7 +1298,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text("會議記錄列表"), centerTitle: true),
-      // --- 新增：綁定 notesNotifier，只要資料庫有變更，這裡自動重繪！ ---
+      // --- 綁定 notesNotifier，只要資料庫有變更，這裡自動重繪！ ---
       body: ValueListenableBuilder<List<MeetingNote>>(
           valueListenable: GlobalManager.notesNotifier,
           builder: (context, notes, child) {
@@ -1337,7 +1374,7 @@ class _HomePageState extends State<HomePage> {
                                     DateFormat('yyyy/MM/dd HH:mm')
                                         .format(note.date),
                                   ),
-                                  // --- 新增：動態顯示分析與下載狀態 ---
+                                  // --- 動態顯示分析與下載狀態 ---
                                   if ((note.status == NoteStatus.processing ||
                                           note.status ==
                                               NoteStatus.downloading) &&
@@ -1416,6 +1453,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   // 新增：紀錄被收合的章節標題
   final Set<String> _collapsedSections = {};
+
+  // --- 新增：多語系顯示開關 ---
+  bool _showOriginal = true;
+  bool _showPhonetic = true;
+  bool _showTranslation = true;
 
   @override
   void initState() {
@@ -1532,7 +1574,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     }
   }
 
-  // 新增：雙擊時直接跳轉並開始播放
+  // 雙擊時直接跳轉並開始播放
   Future<void> _seekAndPlay(double seconds) async {
     File actualFile = await GlobalManager.getActualFile(_note.audioPath);
     if (await actualFile.exists()) {
@@ -1897,14 +1939,22 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   Future<void> _generatePdf() async {
     final pdf = pw.Document();
-    // --- 核心修正：同時載入常規字體與「粗體」字體，解決標題亂碼 ---
+
+    // --- 1. 原本的字體 ---
     final fontRegular = await PdfGoogleFonts.notoSansTCRegular();
     final fontBold = await PdfGoogleFonts.notoSansTCBold();
 
+    // --- 2. 新增：載入韓文專用字體 ---
+    final fontKorean = await PdfGoogleFonts.notoSansKRRegular();
+
     pdf.addPage(
       pw.MultiPage(
-        // 把 bold 字體註冊進主題中，只要用到 FontWeight.bold 就會自動套用
-        theme: pw.ThemeData.withFont(base: fontRegular, bold: fontBold),
+        // --- 3. 修改：加入 fontFallback 陣列 ---
+        theme: pw.ThemeData.withFont(
+          base: fontRegular,
+          bold: fontBold,
+          fontFallback: [fontKorean], // 👈 當 TC 找不到字時，自動用韓文字體補上
+        ),
         build: (context) => [
           pw.Header(
               level: 0,
@@ -2128,10 +2178,125 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
+  // --- 新增：智慧解析多語系文字並依開關顯示 ---
+  Widget _buildParsedText(String text) {
+    // 如果不是外語三行格式，就當作一般中文直接顯示
+    if (!text.contains('[原文]') &&
+        !text.contains('[拼音]') &&
+        !text.contains('[翻譯]')) {
+      return Text(text, style: const TextStyle(fontSize: 16));
+    }
+
+    List<Widget> widgets = [];
+    for (var line in text.split('\n')) {
+      String trimmed = line.trim();
+      if (trimmed.startsWith('[原文]')) {
+        if (_showOriginal) {
+          widgets.add(Text(trimmed,
+              style:
+                  const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)));
+        }
+      } else if (trimmed.startsWith('[拼音]')) {
+        if (_showPhonetic) {
+          widgets.add(Text(trimmed,
+              style: const TextStyle(
+                  fontSize: 14,
+                  color: Colors.blueGrey,
+                  fontStyle: FontStyle.italic)));
+        }
+      } else if (trimmed.startsWith('[翻譯]')) {
+        if (_showTranslation) {
+          widgets.add(Text(trimmed,
+              style: TextStyle(fontSize: 16, color: Colors.green.shade700)));
+        }
+      } else if (trimmed.isNotEmpty) {
+        // 捕捉 AI 偶爾多講的廢話或無標籤的句子
+        widgets.add(Text(trimmed,
+            style: TextStyle(fontSize: 16, color: Colors.green.shade700)));
+      }
+    }
+
+    // 如果使用者把三個開關都關掉，至少顯示個提示
+    if (widgets.isEmpty) {
+      return const Text("...", style: TextStyle(color: Colors.grey));
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: widgets,
+    );
+  }
+
   // --- 改良版：帶有章節歸屬與動態高亮的逐字稿列表 ---
   Widget _buildTranscriptTab() {
     List<Widget> listItems = [];
+    // --- 新增：多語系顯示切換列 (置於逐字稿最上方) ---
+    if (_note.transcript.isNotEmpty) {
+      listItems.add(
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          color: Colors.grey.shade50,
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 8,
+            children: [
+              const Icon(Icons.g_translate, size: 18, color: Colors.blueGrey),
+              const Text("多語系顯示：",
+                  style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.blueGrey,
+                      fontWeight: FontWeight.bold)),
+              FilterChip(
+                label: const Text("原文", style: TextStyle(fontSize: 12)),
+                selected: _showOriginal,
+                onSelected: (val) => setState(() => _showOriginal = val),
+                visualDensity: VisualDensity.compact,
+                selectedColor: Colors.blue.shade100,
+              ),
+              FilterChip(
+                label: const Text("拼音", style: TextStyle(fontSize: 12)),
+                selected: _showPhonetic,
+                onSelected: (val) => setState(() => _showPhonetic = val),
+                visualDensity: VisualDensity.compact,
+                selectedColor: Colors.blue.shade100,
+              ),
+              FilterChip(
+                label: const Text("翻譯", style: TextStyle(fontSize: 12)),
+                selected: _showTranslation,
+                onSelected: (val) => setState(() => _showTranslation = val),
+                visualDensity: VisualDensity.compact,
+                selectedColor: Colors.blue.shade100,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     String? currentChapter;
+
+    // --- 新增：智慧大頭貼縮寫邏輯 ---
+    String getSpeakerAvatarChar(String name) {
+      if (name.isEmpty) return "?";
+      String cleanName = name.trim();
+
+      // 1. 處理 "Speaker A", "Speaker B" -> 取最後的字母 A 或 B
+      if (cleanName.toLowerCase().startsWith('speaker ')) {
+        return cleanName.split(' ').last[0].toUpperCase();
+      }
+      // 2. 處理中文名字 -> 取最後一個字 (如「家偉」->「偉」, 「李四」->「四」)
+      if (RegExp(r'[\u4e00-\u9fa5]').hasMatch(cleanName) &&
+          cleanName.length >= 2) {
+        return cleanName.substring(cleanName.length - 1);
+      }
+      // 3. 處理英文全名 -> 取最後一個單字的首字母 (如 "John Doe" -> "D")
+      if (cleanName.contains(' ')) {
+        return cleanName.split(' ').last[0].toUpperCase();
+      }
+      // 4. 預設取第一個字
+      return cleanName[0].toUpperCase();
+    }
+    // ---------------------------------
 
     for (int i = 0; i < _note.transcript.length; i++) {
       final item = _note.transcript[i];
@@ -2143,7 +2308,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         sec = null;
       }
 
-      // 1. 章節標題 (加入點擊收合功能)
+      // 1. 章節標題
       if (sec != null && sec.title != currentChapter) {
         currentChapter = sec.title;
         bool isCollapsed = _collapsedSections.contains(currentChapter);
@@ -2179,14 +2344,12 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         );
       }
 
-      // 2. 如果該章節被收合，跳過渲染此對話項目
+      // 2. 被收合的章節隱藏對話
       if (sec != null && _collapsedSections.contains(sec.title)) {
         continue;
       }
 
-      // 3. 渲染對話內容
       if (!_transcriptKeys.containsKey(i)) _transcriptKeys[i] = GlobalKey();
-
       bool isActive = i == _currentActiveTranscriptIndex;
 
       listItems.add(
@@ -2204,9 +2367,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                 children: [
                   InkWell(
                     onTap: () => _changeSpeaker(i),
+                    // --- 修改：套用智慧縮寫函數 ---
                     child: CircleAvatar(
-                        child: Text(
-                            item.speaker.isNotEmpty ? item.speaker[0] : "?")),
+                        child: Text(getSpeakerAvatarChar(item.speaker))),
                   ),
                   const SizedBox(width: 16),
                   Expanded(
@@ -2219,7 +2382,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                                 fontSize: 12,
                                 color: Colors.blueGrey)),
                         const SizedBox(height: 4),
-                        Text(item.text, style: const TextStyle(fontSize: 16)),
+                        // --- 核心修正：將原本單純的 Text 替換為支援開關的多語系文字解析器 ---
+                        _buildParsedText(item.text),
                       ],
                     ),
                   ),
@@ -2343,7 +2507,7 @@ class _SettingsPageState extends State<SettingsPage> {
     });
   }
 
-  // --- 新增：測試與載入模型邏輯 ---
+  // --- 測試與載入模型邏輯 ---
   Future<void> _testAndLoadModels() async {
     final apiKey = _apiKeyController.text.trim();
     if (apiKey.isEmpty) {
@@ -2440,7 +2604,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 10),
 
-          // --- 新增：測試 API Key 的按鈕 ---
+          // --- 測試 API Key 的按鈕 ---
           ElevatedButton.icon(
             onPressed: _isLoadingModels ? null : _testAndLoadModels,
             icon: _isLoadingModels
@@ -2564,7 +2728,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-// --- 新增：日誌檢視頁面 (增強版：加入分享功能) ---
+// --- 日誌檢視頁面 (增強版：加入分享功能) ---
 class LogViewerPage extends StatelessWidget {
   const LogViewerPage({super.key});
 
@@ -2581,7 +2745,7 @@ class LogViewerPage extends StatelessWidget {
               GlobalManager.logsNotifier.value = []; // 清空日誌
             },
           ),
-          // 2. 分享按鈕 (新增功能)
+          // 2. 分享按鈕
           IconButton(
             icon: const Icon(Icons.share),
             onPressed: () async {

@@ -1,7 +1,7 @@
 name: myapp
 description: "A new Flutter project."
 publish_to: 'none'
-version: 1.0.17+1
+version: 1.0.19+1
 
 environment:
   sdk: ^3.5.0
@@ -53,6 +53,6 @@ flutter:
 # 新增：ICON 設定 (請確保 assets/app_icon.png 存在，或修改 image_path)
 flutter_launcher_icons:
   android: "ic_launcher"
-  ios: false                 # 修改：關閉 iOS 生成，避免報錯
-  image_path: "web/icons/Icon-512.png" # 修改：直接使用您專案中現有的圖片，不用另外上傳 assets
+  ios: false                 # 若您後續需要打包 iOS 版本，請記得將此處改為 true
+  image_path: "assets/app_icon.png" # 👈 修改這裡，指向您剛放入的圖片路徑
   min_sdk_android: 21
