@@ -624,7 +624,7 @@ class GlobalManager {
     return File('${dir.path}/$fileName');
   }
 
-  // --- AI 分析核心 (強烈約束防幻覺版) ---
+  // --- AI 分析核心 (強烈約束防幻覺與防止時間軸偏移版) ---
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.currentStep = "準備讀取音檔...";
@@ -632,7 +632,8 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName = prefs.getString('model_name') ?? 'gemini-2.0-flash';
+    final modelName =
+        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -649,10 +650,13 @@ class GlobalManager {
       final duration = await tempPlayer.getDuration();
       await tempPlayer.dispose();
 
-      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
-      if (totalSeconds <= 0) totalSeconds = 600.0 * 18;
+      // 💡【核心修正 1】：將切片長度從 600 秒縮短為 300 秒 (5分鐘)，大幅減少 AI 時間軸偏移
+      final int chunkSize = 300;
 
-      int maxChunks = (totalSeconds / 600).ceil();
+      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
+
+      int maxChunks = (totalSeconds / chunkSize).ceil();
       if (maxChunks == 0) maxChunks = 1;
 
       _log("開始 Multipart 上傳...");
@@ -701,7 +705,6 @@ class GlobalManager {
               .toList() ??
           [];
 
-      // 💡 修正：剔除超時幻覺
       note.sections = (overviewJson['sections'] as List<dynamic>?)
               ?.map((e) => Section.fromJson(e))
               .toList() ??
@@ -719,20 +722,19 @@ class GlobalManager {
         await saveNote(note);
         _log(note.currentStep);
 
-        double chunkStart = (i * 600).toDouble();
-        double chunkEnd = ((i + 1) * 600).toDouble();
+        double chunkStart = (i * chunkSize).toDouble();
+        double chunkEnd = ((i + 1) * chunkSize).toDouble();
 
+        // 💡【核心修正 2】：加入嚴格的「強制細部分段」指令，逼迫 AI 密集產生時間戳
         String transcriptPrompt = """
         請扮演一位極度專業的「逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
         
         【最高指導原則】：
         1. 嚴禁憑空捏造！若該段時間無人說話、只有環境音，請直接回傳空陣列 []。
-        2. 忠實還原：請勿擅自摘要、潤飾或刪減對話。即便是贅詞、停頓語氣也請盡量保留，以還原真實對話情境。
-        3. 精準辨識講者：請敏銳地根據音色、語氣、遠近與對話輪替，嚴格區分不同的說話者。若遇搶話或發言中斷，請精準斷句並給予不同的 speaker 標籤（如 Speaker A, Speaker B）。
-        
-        【精準辨識講者防錯機制】(極重要)：
-        請敏銳地根據「音色」、「語氣」與「對話邏輯」來區分說話者。
-        ⚠️ 致命陷阱警告：當說話者 A 提到 B 的名字，或是 A 在模仿 B 講話時，說話者依然是 A！絕對不可因為聽到 B 的名字，就誤判為 B 在發言。
+        2. 忠實還原：請勿擅自摘要、潤飾或刪減對話。即便是贅詞、停頓語氣也請盡量保留。
+        3. 精準辨識講者：請敏銳地根據音色、語氣、遠近與對話輪替，嚴格區分不同的說話者。
+        4. 【強制細部分段 (防止時間軸偏移) - 極度重要】：若單一講者連續發言，請「強制」每講完 1~2 句話（或大約每 10~15 秒）就斷開產生一筆新的 JSON，並重新對齊精準的 `startTime`。絕對禁止將長達數十秒的對話合併成單一 JSON 節點！
+        5. 【時間戳嚴格校準】：startTime 必須與音訊實際發生的秒數完全吻合（落在 $chunkStart 到 $chunkEnd 之間），嚴禁擅自偏移、延遲或捏造。
         
         【多語系與翻譯規則】(極重要)：
         1. 若對話中僅夾雜「非中文單字/詞彙」，請保留原文，並在後方用括號附上繁體中文翻譯。範例：「這個 project (專案) 要確認。」
@@ -757,7 +759,6 @@ class GlobalManager {
             emptyCount = 0;
             var newItems =
                 chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
-            // 💡 修正：剔除超過音檔總長度的幻覺對話
             newItems.removeWhere((item) => item.startTime > totalSeconds);
             fullTranscript.addAll(newItems);
           }
@@ -786,7 +787,7 @@ class GlobalManager {
     }
   }
 
-  // --- 新增：從目前中斷的地方繼續補全逐字稿 ---
+  // --- 從目前中斷的地方繼續補全逐字稿 (同步更新) ---
   static Future<void> completeMissingTranscript(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.currentStep = "準備讀取音檔與上傳...";
@@ -794,7 +795,8 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName = prefs.getString('model_name') ?? 'gemini-2.0-flash';
+    final modelName =
+        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -808,25 +810,25 @@ class GlobalManager {
       final duration = await tempPlayer.getDuration();
       await tempPlayer.dispose();
 
-      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
-      if (totalSeconds <= 0) totalSeconds = 600.0 * 18; // 備用防呆：最多3小時
+      // 💡 同步縮短為 300 秒 (5分鐘)
+      final int chunkSize = 300;
 
-      int maxChunks = (totalSeconds / 600).ceil();
+      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
+
+      int maxChunks = (totalSeconds / chunkSize).ceil();
       if (maxChunks == 0) maxChunks = 1;
 
-      // 取得目前逐字稿的最後時間
       double lastTime =
           note.transcript.isEmpty ? 0.0 : note.transcript.last.startTime;
-      int startChunk = (lastTime / 600).floor();
+      int startChunk = (lastTime / chunkSize).floor();
 
-      // 防呆：如果逐字稿已經超過音檔總長度
       if (startChunk >= maxChunks) {
         _log("逐字稿已達音檔結尾，無需補全。");
         await reSummarizeFromTranscript(note);
         return;
       }
 
-      // --- 上傳檔案 ---
       final fileInfo = await GeminiRestApi.uploadFile(
           apiKey, audioFile, 'audio/mp4', note.title);
       final String fileUri = fileInfo['uri'];
@@ -849,8 +851,8 @@ class GlobalManager {
         await saveNote(note);
         _log(note.currentStep);
 
-        double chunkStart = (i * 600).toDouble();
-        double chunkEnd = ((i + 1) * 600).toDouble();
+        double chunkStart = (i * chunkSize).toDouble();
+        double chunkEnd = ((i + 1) * chunkSize).toDouble();
 
         String extraInstruction = i == startChunk && lastContext.isNotEmpty
             ? "【上下文無縫接合指示】：前一段的最後幾句對話是：\n---\n$lastContext\n---\n請你仔細在音檔中找到這段話的位置，並「嚴格從這句話結束的地方」開始繼續聽打！絕對不要從頭開始，也不要重複輸出這幾句話。"
@@ -864,8 +866,9 @@ class GlobalManager {
         
         【最高指導原則】：
         1. 嚴禁憑空捏造！若無對話請回傳 []。
-        2. 所有的 startTime 必須是基於音檔開頭的「絕對秒數」（例如必須大於 $lastTime）。
-        3. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
+        2. 【強制細部分段 (防止時間軸偏移)】：若單一講者連續發言，請「強制」每講完 1~2 句話（或大約每 10~15 秒）就斷開產生一筆新的 JSON。絕對禁止將長達數十秒的對話合併成單一 JSON 節點！
+        3. 【時間戳嚴格校準】：所有的 startTime 必須是基於音檔開頭的「絕對秒數」（例如必須大於 $lastTime，且嚴格對齊語音實際發生的秒數）。
+        4. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
         
         回傳純 JSON 陣列格式範例：
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
@@ -878,14 +881,13 @@ class GlobalManager {
 
           if (chunkList.isEmpty) {
             emptyCount++;
-            if (emptyCount >= 2) break; // 連續兩段無聲，提早結束
+            if (emptyCount >= 2) break;
           } else {
             emptyCount = 0;
             var newItems = chunkList
                 .map((e) => TranscriptItem.fromJson(e))
                 .where((item) =>
-                    item.startTime > lastTime &&
-                    item.startTime <= totalSeconds) // 💡 修正：雙向限制防幻覺
+                    item.startTime > lastTime && item.startTime <= totalSeconds)
                 .toList();
             note.transcript.addAll(newItems);
           }
