@@ -40,7 +40,6 @@ class TranscriptItem {
   Map<String, dynamic> toJson() =>
       {'speaker': speaker, 'text': text, 'startTime': startTime};
 
-  // 修改：改用 dynamic 接收，並處理字串例外
   factory TranscriptItem.fromJson(dynamic json) {
     if (json is String) return TranscriptItem(speaker: 'Unknown', text: json);
     if (json is Map) {
@@ -48,9 +47,10 @@ class TranscriptItem {
       var st = json['startTime'];
       if (st is num) {
         parsedTime = st.toDouble();
-      } else if (st is String)
+      } else if (st is String) {
         parsedTime =
             double.tryParse(st.replaceAll(RegExp(r'[^0-9.]'), '')) ?? 0.0;
+      }
       return TranscriptItem(
         speaker: json['speaker']?.toString() ?? 'Unknown',
         text: json['text']?.toString() ?? '',
@@ -71,7 +71,6 @@ class TaskItem {
   Map<String, dynamic> toJson() =>
       {'description': description, 'assignee': assignee, 'dueDate': dueDate};
 
-  // 修改：增強容錯
   factory TaskItem.fromJson(dynamic json) {
     if (json is String) return TaskItem(description: json);
     if (json is Map) {
@@ -128,7 +127,7 @@ class MeetingNote {
   List<Section> sections;
   NoteStatus status;
   bool isPinned;
-  String currentStep; // 紀錄當前處理進度文字
+  String currentStep;
 
   MeetingNote({
     required this.id,
@@ -141,7 +140,7 @@ class MeetingNote {
     this.sections = const [],
     this.status = NoteStatus.success,
     this.isPinned = false,
-    this.currentStep = '', // 預設為空
+    this.currentStep = '',
   });
 
   Map<String, dynamic> toJson() => {
@@ -155,7 +154,7 @@ class MeetingNote {
         'sections': sections.map((e) => e.toJson()).toList(),
         'status': status.index,
         'isPinned': isPinned,
-        'currentStep': currentStep, // 儲存進度
+        'currentStep': currentStep,
       };
 
   factory MeetingNote.fromJson(Map<String, dynamic> json) {
@@ -179,19 +178,17 @@ class MeetingNote {
           [],
       status: NoteStatus.values[json['status'] ?? 2],
       isPinned: json['isPinned'] ?? false,
-      currentStep: json['currentStep']?.toString() ?? '', // 讀取進度
+      currentStep: json['currentStep']?.toString() ?? '',
     );
   }
 }
 
-// --- 獨立的 REST API 處理類別 (修正網址與上傳邏輯) ---
-// --- 輔助 Log 函式 (修改版) ---
+// --- 輔助 Log 函式 ---
 void _log(String message) {
-  // 將訊息存入 GlobalManager 讓手機畫面可以顯示
   GlobalManager.addLog(message);
 }
 
-// --- 獨立的 REST API 處理類別 (修正網址與 Resumable Upload) ---
+// --- 獨立的 REST API 處理類別 (加入自動模型備援機制) ---
 class GeminiRestApi {
   static const String _baseUrl = 'https://generativelanguage.googleapis.com';
 
@@ -275,148 +272,185 @@ class GeminiRestApi {
     throw Exception('Timeout waiting for file to become ACTIVE');
   }
 
+  // --- 核心修正：自動備援模型清單切換機制 ---
   static Future<String> generateContent(
     String apiKey,
-    String modelName,
+    String primaryModel,
     String prompt,
     String fileUri,
     String mimeType,
   ) async {
-    final url = Uri.parse(
-        '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
+    List<String> modelsToTry = [
+      primaryModel,
+      'gemini-flash-latest',
+      'gemini-3-flash-preview',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash'
+    ].toSet().toList(); // 去除重複並保持優先順序
 
-    int retryCount = 0;
-    int maxRetries = 5; // 增加最高重試次數
+    for (int modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
+      String currentModel = modelsToTry[modelIndex];
+      final url = Uri.parse(
+          '$_baseUrl/v1beta/models/$currentModel:generateContent?key=$apiKey');
 
-    while (true) {
-      if (retryCount == 0) _log('發送 Prompt 至模型: $modelName');
+      int retryCount = 0;
+      int maxRetries = 4; // 針對單一模型的最高重試次數
 
-      try {
-        // --- 加入 120 秒超時保護 ---
-        final response = await http
-            .post(
-              url,
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({
-                'contents': [
-                  {
-                    'parts': [
-                      {'text': prompt},
-                      {
-                        'file_data': {
-                          'mime_type': mimeType,
-                          'file_uri': fileUri
+      while (retryCount < maxRetries) {
+        if (retryCount == 0) _log('發送 Prompt 至模型: $currentModel');
+
+        try {
+          final response = await http
+              .post(
+                url,
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'contents': [
+                    {
+                      'parts': [
+                        {'text': prompt},
+                        {
+                          'file_data': {
+                            'mime_type': mimeType,
+                            'file_uri': fileUri
+                          }
                         }
-                      }
-                    ]
-                  }
-                ],
-                'generationConfig': {'responseMimeType': 'application/json'}
-              }),
-            )
-            .timeout(const Duration(seconds: 120));
+                      ]
+                    }
+                  ],
+                  'generationConfig': {'responseMimeType': 'application/json'}
+                }),
+              )
+              .timeout(const Duration(seconds: 120));
 
-        if (response.statusCode == 429 && retryCount < maxRetries) {
-          double waitSeconds = 20.0;
-          final match =
-              RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
-          if (match != null && match.group(1) != null) {
-            waitSeconds = double.parse(match.group(1)!) + 3.0;
-          } else {
-            waitSeconds = 20.0 * (retryCount + 1);
+          if (response.statusCode == 429) {
+            if (response.body.contains('RESOURCE_EXHAUSTED') ||
+                response.body.contains('Quota exceeded')) {
+              _log("⚠️ 模型 $currentModel 額度已耗盡，自動切換至備用模型...");
+              break; // 跳出內層 while 迴圈，讓外層 for 迴圈切換至下一個模型
+            } else {
+              double waitSeconds = 20.0;
+              final match = RegExp(r'retry in (\d+(?:\.\d+)?)s')
+                  .firstMatch(response.body);
+              if (match != null && match.group(1) != null) {
+                waitSeconds = double.parse(match.group(1)!) + 3.0;
+              } else {
+                waitSeconds = 20.0 * (retryCount + 1);
+              }
+              _log(
+                  "⚠️ 觸發 API 頻率限制 (429)，等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
+              await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+              retryCount++;
+              continue;
+            }
           }
-          _log(
-              "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
-          await Future.delayed(Duration(seconds: waitSeconds.toInt()));
-          retryCount++;
-          continue;
-        }
 
-        if (response.statusCode != 200) {
-          throw Exception('Generate content failed: ${response.body}');
-        }
+          if (response.statusCode != 200) {
+            throw Exception('Generate content failed: ${response.body}');
+          }
 
-        return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
-            ['text'];
-      } catch (e) {
-        // --- 核心修正：攔截網路中斷 (ClientException/SocketException) 並觸發重試 ---
-        if (retryCount < maxRetries &&
-            !e.toString().contains('Generate content failed')) {
-          _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試 (第 ${retryCount + 1} 次)...");
-          await Future.delayed(const Duration(seconds: 5));
-          retryCount++;
-          continue;
+          return jsonDecode(response.body)['candidates'][0]['content']['parts']
+              [0]['text'];
+        } catch (e) {
+          if (retryCount < maxRetries - 1 &&
+              !e.toString().contains('Generate content failed')) {
+            _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試 (第 ${retryCount + 1} 次)...");
+            await Future.delayed(const Duration(seconds: 5));
+            retryCount++;
+            continue;
+          } else if (e.toString().contains('Generate content failed')) {
+            _log("⚠️ 模型 $currentModel 處理失敗，嘗試切換模型...");
+            break; // 發生 Google 內部錯誤，切換模型
+          }
+          throw Exception('API 請求最終失敗: $e');
         }
-        throw Exception('API 請求最終失敗: $e');
       }
     }
+    throw Exception('所有可用模型均已嘗試失敗或額度耗盡。請稍後再試或更換 API Key。');
   }
 
-// --- 純文字分析 (用於基於修改後逐字稿重新摘要) ---
+  // --- 純文字分析 (用於基於修改後逐字稿重新摘要，加入自動備援機制) ---
   static Future<String> generateTextOnly(
-      String apiKey, String modelName, String prompt) async {
-    final url = Uri.parse(
-        '$_baseUrl/v1beta/models/$modelName:generateContent?key=$apiKey');
+      String apiKey, String primaryModel, String prompt) async {
+    List<String> modelsToTry = [
+      primaryModel,
+      'gemini-flash-latest',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash'
+    ].toSet().toList();
 
-    int retryCount = 0;
-    int maxRetries = 5;
+    for (int modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
+      String currentModel = modelsToTry[modelIndex];
+      final url = Uri.parse(
+          '$_baseUrl/v1beta/models/$currentModel:generateContent?key=$apiKey');
 
-    while (true) {
-      if (retryCount == 0) _log('發送純文字 Prompt 至模型: $modelName');
+      int retryCount = 0;
+      int maxRetries = 4;
 
-      try {
-        // --- 加入 120 秒超時保護 ---
-        final response = await http
-            .post(
-              url,
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({
-                'contents': [
-                  {
-                    'parts': [
-                      {'text': prompt} // 👈 核心修正：純文字分析只傳送 prompt，不包含 file_data
-                    ]
-                  }
-                ],
-                'generationConfig': {'responseMimeType': 'application/json'}
-              }),
-            )
-            .timeout(const Duration(seconds: 120));
+      while (retryCount < maxRetries) {
+        if (retryCount == 0) _log('發送純文字 Prompt 至模型: $currentModel');
 
-        if (response.statusCode == 429 && retryCount < maxRetries) {
-          double waitSeconds = 20.0;
-          final match =
-              RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
-          if (match != null && match.group(1) != null) {
-            waitSeconds = double.parse(match.group(1)!) + 3.0;
-          } else {
-            waitSeconds = 20.0 * (retryCount + 1);
+        try {
+          final response = await http
+              .post(
+                url,
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'contents': [
+                    {
+                      'parts': [
+                        {'text': prompt}
+                      ]
+                    }
+                  ],
+                  'generationConfig': {'responseMimeType': 'application/json'}
+                }),
+              )
+              .timeout(const Duration(seconds: 120));
+
+          if (response.statusCode == 429) {
+            if (response.body.contains('RESOURCE_EXHAUSTED') ||
+                response.body.contains('Quota exceeded')) {
+              _log("⚠️ 模型 $currentModel 額度已耗盡，自動切換至備用模型...");
+              break;
+            } else {
+              double waitSeconds = 20.0;
+              final match = RegExp(r'retry in (\d+(?:\.\d+)?)s')
+                  .firstMatch(response.body);
+              if (match != null && match.group(1) != null) {
+                waitSeconds = double.parse(match.group(1)!) + 3.0;
+              } else {
+                waitSeconds = 20.0 * (retryCount + 1);
+              }
+              _log("⚠️ 觸發 API 頻率限制 (429)，等待 ${waitSeconds.toInt()} 秒後重試...");
+              await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+              retryCount++;
+              continue;
+            }
           }
-          _log(
-              "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
-          await Future.delayed(Duration(seconds: waitSeconds.toInt()));
-          retryCount++;
-          continue;
-        }
 
-        if (response.statusCode != 200) {
-          throw Exception('Generate content failed: ${response.body}');
-        }
+          if (response.statusCode != 200) {
+            throw Exception('Generate content failed: ${response.body}');
+          }
 
-        return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
-            ['text'];
-      } catch (e) {
-        // --- 核心修正：攔截網路中斷 (ClientException/SocketException) 並觸發重試 ---
-        if (retryCount < maxRetries &&
-            !e.toString().contains('Generate content failed')) {
-          _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試 (第 ${retryCount + 1} 次)...");
-          await Future.delayed(const Duration(seconds: 5));
-          retryCount++;
-          continue;
+          return jsonDecode(response.body)['candidates'][0]['content']['parts']
+              [0]['text'];
+        } catch (e) {
+          if (retryCount < maxRetries - 1 &&
+              !e.toString().contains('Generate content failed')) {
+            _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試...");
+            await Future.delayed(const Duration(seconds: 5));
+            retryCount++;
+            continue;
+          } else if (e.toString().contains('Generate content failed')) {
+            _log("⚠️ 模型 $currentModel 處理失敗，嘗試切換模型...");
+            break;
+          }
+          throw Exception('API 請求最終失敗: $e');
         }
-        throw Exception('API 請求最終失敗: $e');
       }
     }
+    throw Exception('所有可用模型均已嘗試失敗或額度耗盡。');
   }
 
   // --- 測試 API Key 並取得可用模型清單 ---
@@ -455,18 +489,24 @@ class GlobalManager {
   static final ValueNotifier<List<String>> participantListNotifier =
       ValueNotifier([]);
   static final ValueNotifier<List<String>> logsNotifier = ValueNotifier([]);
-
-  // --- 用於即時更新首頁列表的推播器 ---
   static final ValueNotifier<List<MeetingNote>> notesNotifier =
       ValueNotifier([]);
 
-  // --- 修改：加入儲存日誌的邏輯 ---
+  // --- 核心修正：統一時間格式函數 ---
+  static String formatTime(double seconds) {
+    if (seconds.isNaN || seconds < 0) return "00:00";
+    final duration = Duration(milliseconds: (seconds * 1000).toInt());
+    final h = duration.inHours;
+    final m = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
   static void addLog(String message) async {
     final time = DateFormat('HH:mm:ss').format(DateTime.now());
     final newLog = "[$time] [APP] $message";
     final currentLogs = logsNotifier.value;
 
-    // 限制最多存 500 筆，避免日誌無限膨脹塞爆儲存空間
     final updatedLogs = currentLogs.length > 500
         ? [newLog, ...currentLogs.take(499)]
         : [newLog, ...currentLogs];
@@ -474,22 +514,19 @@ class GlobalManager {
     logsNotifier.value = updatedLogs;
     print(newLog);
 
-    // 同步寫入 SharedPreferences
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('app_logs', updatedLogs);
   }
 
-  // --- 修改：初始化時載入歷史日誌 ---
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
     participantListNotifier.value =
         prefs.getStringList('participant_list') ?? [];
-    logsNotifier.value = prefs.getStringList('app_logs') ?? []; // 載入日誌
-    await loadNotes(); // 初始化時自動載入一次筆記
+    logsNotifier.value = prefs.getStringList('app_logs') ?? [];
+    await loadNotes();
   }
 
-  // --- 將載入筆記獨立出來，並更新 Notifier ---
   static Future<void> loadNotes() async {
     final prefs = await SharedPreferences.getInstance();
     final String? existingJson = prefs.getString('meeting_notes');
@@ -502,7 +539,7 @@ class GlobalManager {
           if (a.isPinned != b.isPinned) return a.isPinned ? -1 : 1;
           return b.date.compareTo(a.date);
         });
-        notesNotifier.value = loaded; // 推播給首頁更新畫面
+        notesNotifier.value = loaded;
       } catch (e) {
         print("Load error: $e");
       }
@@ -562,8 +599,6 @@ class GlobalManager {
     }
     await prefs.setString(
         'meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
-
-    // --- 每次存檔完自動刷新 Notifier ---
     await loadNotes();
   }
 
@@ -577,8 +612,6 @@ class GlobalManager {
       notes.removeWhere((n) => n.id == id);
       await prefs.setString(
           'meeting_notes', jsonEncode(notes.map((e) => e.toJson()).toList()));
-
-      // --- 每次刪除完自動刷新 Notifier ---
       await loadNotes();
     }
   }
@@ -599,8 +632,7 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName =
-        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
+    final modelName = prefs.getString('model_name') ?? 'gemini-2.0-flash';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -612,7 +644,6 @@ class GlobalManager {
         throw Exception("找不到音訊檔案: ${note.audioPath}");
       }
 
-      // 💡【核心修正 1】：精準取得本地音檔真實長度
       final tempPlayer = AudioPlayer();
       await tempPlayer.setSource(DeviceFileSource(audioFile.path));
       final duration = await tempPlayer.getDuration();
@@ -637,7 +668,6 @@ class GlobalManager {
       note.currentStep = "AI 正在分析會議摘要...";
       await saveNote(note);
 
-      // --- 修正：嚴防預設名單污染摘要 ---
       String overviewPrompt = """
       你是一個專業的會議記錄助理。
       專有詞彙庫：${vocabList.join(', ')} (僅供聽寫校正參考)。
@@ -670,16 +700,22 @@ class GlobalManager {
               ?.map((e) => TaskItem.fromJson(e))
               .toList() ??
           [];
+
+      // 💡 修正：剔除超時幻覺
       note.sections = (overviewJson['sections'] as List<dynamic>?)
               ?.map((e) => Section.fromJson(e))
               .toList() ??
           [];
+      for (var sec in note.sections) {
+        if (sec.endTime > totalSeconds) sec.endTime = totalSeconds;
+        if (sec.startTime > totalSeconds) sec.startTime = totalSeconds - 1;
+      }
 
       List<TranscriptItem> fullTranscript = [];
       int emptyCount = 0;
 
       for (int i = 0; i < maxChunks; i++) {
-        note.currentStep = "分析逐字稿 (${i + 1}/$maxChunks)..."; // 💡 UI 精準顯示進度
+        note.currentStep = "分析逐字稿 (${i + 1}/$maxChunks)...";
         await saveNote(note);
         _log(note.currentStep);
 
@@ -704,10 +740,6 @@ class GlobalManager {
            [原文] {外語原本的文字，如日文漢字/假名、韓文諺文等}
            [拼音] {對應的羅馬拼音 (Romaji/Pinyin) 或發音提示}
            [翻譯] {繁體中文翻譯}
-           (範例)：
-           [原文] 本当にありがとうございます
-           [拼音] Hontou ni arigatou gozaimasu
-           [翻譯] 真的非常感謝
 
         回傳純 JSON 陣列格式範例：
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
@@ -723,13 +755,16 @@ class GlobalManager {
             if (emptyCount >= 2) break;
           } else {
             emptyCount = 0;
-            fullTranscript.addAll(
-                chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
+            var newItems =
+                chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
+            // 💡 修正：剔除超過音檔總長度的幻覺對話
+            newItems.removeWhere((item) => item.startTime > totalSeconds);
+            fullTranscript.addAll(newItems);
           }
         } catch (e) {
           _log("分段 $i 最終分析失敗: $e");
           _log("⚠️ 遇到嚴重例外，終止後續分段提取以保護應用程序。");
-          break; // 💡【核心修正 3】：中斷迴圈
+          break;
         }
 
         if (i < maxChunks - 1) {
@@ -759,8 +794,7 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName =
-        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
+    final modelName = prefs.getString('model_name') ?? 'gemini-2.0-flash';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -769,7 +803,6 @@ class GlobalManager {
 
       final audioFile = await getActualFile(note.audioPath);
 
-      // 💡【核心修正 1】：精準取得本地音檔的真實長度
       final tempPlayer = AudioPlayer();
       await tempPlayer.setSource(DeviceFileSource(audioFile.path));
       final duration = await tempPlayer.getDuration();
@@ -800,7 +833,6 @@ class GlobalManager {
       final String fileName = fileInfo['name'].split('/').last;
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
-      // 💡【新增】：取得最後幾句話作為上下文錨點，強迫 AI 尋找斷點
       String lastContext = "";
       if (note.transcript.isNotEmpty) {
         int takeCount = note.transcript.length > 4 ? 4 : note.transcript.length;
@@ -813,7 +845,6 @@ class GlobalManager {
       int emptyCount = 0;
 
       for (int i = startChunk; i < maxChunks; i++) {
-        // 💡【核心修正 2】：UI 顯示精確的總段數，例如 (2/3)
         note.currentStep = "補全逐字稿 (${i + 1}/$maxChunks)...";
         await saveNote(note);
         _log(note.currentStep);
@@ -821,7 +852,6 @@ class GlobalManager {
         double chunkStart = (i * 600).toDouble();
         double chunkEnd = ((i + 1) * 600).toDouble();
 
-        // 💡【修正】：利用上下文錨點強迫 AI 無縫接合
         String extraInstruction = i == startChunk && lastContext.isNotEmpty
             ? "【上下文無縫接合指示】：前一段的最後幾句對話是：\n---\n$lastContext\n---\n請你仔細在音檔中找到這段話的位置，並「嚴格從這句話結束的地方」開始繼續聽打！絕對不要從頭開始，也不要重複輸出這幾句話。"
             : "特別注意：請忽略 $chunkStart 秒之前的內容，直接從 $chunkStart 秒開始聽打。";
@@ -853,13 +883,14 @@ class GlobalManager {
             emptyCount = 0;
             var newItems = chunkList
                 .map((e) => TranscriptItem.fromJson(e))
-                .where((item) => item.startTime > lastTime)
+                .where((item) =>
+                    item.startTime > lastTime &&
+                    item.startTime <= totalSeconds) // 💡 修正：雙向限制防幻覺
                 .toList();
             note.transcript.addAll(newItems);
           }
         } catch (e) {
           _log("分段 $i 補全失敗: $e");
-          // 💡【核心修正 3】：遇到嚴重連線錯誤，中斷整個迴圈，不浪費時間測試下一段
           _log("⚠️ 檢測到嚴重異常，終止後續分析以保護進度。");
           break;
         }
@@ -890,6 +921,15 @@ class GlobalManager {
 
     try {
       if (apiKey.isEmpty) throw Exception("請先設定 API Key");
+
+      // 取出真實音檔秒數作為後續過濾用
+      final audioFile = await getActualFile(note.audioPath);
+      final tempPlayer = AudioPlayer();
+      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
+      final duration = await tempPlayer.getDuration();
+      await tempPlayer.dispose();
+      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      if (totalSeconds <= 0) totalSeconds = 600.0 * 18;
 
       StringBuffer sb = StringBuffer();
       for (var t in note.transcript) {
@@ -930,10 +970,17 @@ class GlobalManager {
               ?.map((e) => TaskItem.fromJson(e))
               .toList() ??
           [];
+
       note.sections = (overviewJson['sections'] as List<dynamic>?)
               ?.map((e) => Section.fromJson(e))
               .toList() ??
           [];
+
+      // 💡 修正：剔除超時幻覺
+      for (var sec in note.sections) {
+        if (sec.endTime > totalSeconds) sec.endTime = totalSeconds;
+        if (sec.startTime > totalSeconds) sec.startTime = totalSeconds - 1;
+      }
 
       note.status = NoteStatus.success;
       note.currentStep = '';
@@ -954,8 +1001,9 @@ class GlobalManager {
       String cleanText = text.trim();
       if (cleanText.startsWith('```json')) {
         cleanText = cleanText.substring(7);
-      } else if (cleanText.startsWith('```'))
+      } else if (cleanText.startsWith('```')) {
         cleanText = cleanText.substring(3);
+      }
       if (cleanText.endsWith('```')) {
         cleanText = cleanText.substring(0, cleanText.length - 3);
       }
@@ -973,8 +1021,9 @@ class GlobalManager {
       String cleanText = text.trim();
       if (cleanText.startsWith('```json')) {
         cleanText = cleanText.substring(7);
-      } else if (cleanText.startsWith('```'))
+      } else if (cleanText.startsWith('```')) {
         cleanText = cleanText.substring(3);
+      }
       if (cleanText.endsWith('```')) {
         cleanText = cleanText.substring(0, cleanText.length - 3);
       }
@@ -1028,7 +1077,6 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> startRecording() async {
-    // 確保權限
     Map<Permission, PermissionStatus> statuses = await [
       Permission.microphone,
     ].request();
@@ -1039,21 +1087,18 @@ class _MainAppShellState extends State<MainAppShell> {
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
       final path = '${dir.path}/$fileName';
 
-      // --- 核心修正：將硬體降噪、單聲道、高解析參數完美整合進你的錄音配置中 ---
       await audioRecorder.start(
         const RecordConfig(
-          encoder: AudioEncoder.aacLc, // 使用相容性最高、壓縮比好的 AAC 格式
-          bitRate: 128000, // 確保音質清晰 (128kbps)
-          sampleRate: 44100, // 標準音訊採樣率
-          numChannels: 1, // 【關鍵】設定為單聲道 (Mono) 更利於 AI 語音辨識
-          autoGain: true, // 【關鍵】開啟自動增益：讓小聲說話的人變大聲
-          echoCancel: false, // 💡【關鍵修正 3】關閉硬體回音消除：防止演算法將微弱尾音誤判為回音而截斷
-          noiseSuppress:
-              false, // 💡【關鍵修正 4】關閉硬體降噪：防止降噪閥值過高(Noise Gate)吃掉較小聲的發言。Gemini 模型本身抗噪能力強，保留原始聲音細節給 AI 處理更好。
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+          numChannels: 1,
+          autoGain: true,
+          echoCancel: false,
+          noiseSuppress: false,
         ),
         path: path,
       );
-      // -----------------------------------------------------------------------
 
       stopwatch.reset();
       stopwatch.start();
@@ -1069,7 +1114,6 @@ class _MainAppShellState extends State<MainAppShell> {
         final amplitude = await audioRecorder.getAmplitude();
         final currentAmp = amplitude.current;
 
-        // 保留你原本非常優秀的「智慧靜音分段」邏輯
         if ((duration.inMinutes >= 29 && currentAmp < -30) ||
             duration.inMinutes >= 30) {
           await handleAutoSplit();
@@ -1143,10 +1187,9 @@ class _MainAppShellState extends State<MainAppShell> {
   }
 
   Future<void> pickFile() async {
-    // 解決 Android 13+ 權限問題
     Map<Permission, PermissionStatus> statuses = await [
       Permission.storage,
-      Permission.audio, // Android 13+
+      Permission.audio,
       Permission.mediaLibrary,
     ].request();
 
@@ -1169,14 +1212,10 @@ class _MainAppShellState extends State<MainAppShell> {
 
         DateTime fileDate = DateTime.now();
         try {
-          // 1. 先嘗試取得作業系統給的檔案最後修改時間 (通常是快取建立時間)
           fileDate = await file.lastModified();
 
-          // 2. 智慧檔名解析防呆機制：
-          // 如果修改時間跟現在相差不到 5 分鐘，代表這極可能是 OS 剛複製的快取檔
           if (DateTime.now().difference(fileDate).inMinutes < 5) {
             String fileName = result.files.single.name;
-            // 正則匹配常見錄音檔名格式：YYYYMMDD_HHMMSS 或 YYYY-MM-DD
             RegExp regExp = RegExp(
                 r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})');
             var match = regExp.firstMatch(fileName);
@@ -1206,7 +1245,6 @@ class _MainAppShellState extends State<MainAppShell> {
     }
   }
 
-// --- 整合版 YouTube 匯入與備用串流下載機制 ---
   Future<void> importYoutube() async {
     final TextEditingController urlController = TextEditingController();
     final url = await showDialog<String>(
@@ -1244,7 +1282,7 @@ class _MainAppShellState extends State<MainAppShell> {
         status: NoteStatus.downloading,
         currentStep: "正在解析影片來源...",
       );
-      await GlobalManager.saveNote(note); // 建立初始紀錄，讓首頁顯示進度
+      await GlobalManager.saveNote(note);
       if (mounted) setState(() {});
 
       var yt = YoutubeExplode();
@@ -1258,7 +1296,6 @@ class _MainAppShellState extends State<MainAppShell> {
         var audioStreams = manifest.audioOnly.sortByBitrate().toList();
 
         File? audioFile;
-        // 強化容錯：拉長 Timeout，並攔截特定網路阻擋錯誤
         for (var streamInfo in audioStreams) {
           try {
             var stream = yt.videos.streamsClient.get(streamInfo);
@@ -1266,7 +1303,6 @@ class _MainAppShellState extends State<MainAppShell> {
             audioFile = File('${dir.path}/${video.id}.mp4');
             var fileStream = audioFile.openWrite();
 
-            // --- 縮短為 15 秒，避免無限掛起 ---
             await stream.pipe(fileStream).timeout(const Duration(seconds: 15));
             await fileStream.flush();
             await fileStream.close();
@@ -1287,7 +1323,6 @@ class _MainAppShellState extends State<MainAppShell> {
               audioFile = File('${dir.path}/${video.id}.mp4');
               var fileStream = audioFile.openWrite();
 
-              // 影音檔較大，給予 20 秒
               await stream
                   .pipe(fileStream)
                   .timeout(const Duration(seconds: 20));
@@ -1302,7 +1337,6 @@ class _MainAppShellState extends State<MainAppShell> {
         }
 
         if (audioFile == null || !(await audioFile.exists())) {
-          // 明確拋出例外讓 catch 區塊接手
           throw Exception("下載失敗。可能受到 YouTube 機器人防護阻擋或 DNS 污染。");
         }
 
@@ -1313,8 +1347,6 @@ class _MainAppShellState extends State<MainAppShell> {
         GlobalManager.analyzeNote(note);
       } catch (e) {
         String errorMsg = e.toString();
-        // 偵測是否為 YouTube 的節點封鎖 (如您日誌中的 SocketException)
-        // --- 修正：更明確的阻擋提示 ---
         if (errorMsg.contains("TimeoutException") ||
             errorMsg.contains("SocketException") ||
             errorMsg.contains("host lookup")) {
@@ -1338,7 +1370,6 @@ class _MainAppShellState extends State<MainAppShell> {
     }
   }
 
-// --- 底部彈出選單 (錄音/匯入選項) ---
   void showAddMenu() {
     showModalBottomSheet(
       context: context,
@@ -1348,23 +1379,19 @@ class _MainAppShellState extends State<MainAppShell> {
       builder: (context) => SafeArea(
         child: Wrap(
           children: [
-            // --- 補回開始錄音按鈕 ---
             ListTile(
               leading: const Icon(Icons.mic, color: Colors.green),
               title: const Text('開始錄音'),
               onTap: () {
                 Navigator.pop(context);
-                toggleRecording(); // 呼叫原本的錄音開關
+                toggleRecording();
               },
             ),
-            // ------------------------
             ListTile(
               leading: const Icon(Icons.file_upload, color: Colors.blue),
               title: const Text('匯入本地錄音/音檔'),
               onTap: () {
                 Navigator.pop(context);
-                // 💡 注意：請確認你原本處理選擇檔案的函數名稱是什麼
-                // 如果你的函數叫做 pickFile() 或 importFile()，請改為對應名稱
                 pickFile();
               },
             ),
@@ -1373,7 +1400,7 @@ class _MainAppShellState extends State<MainAppShell> {
               title: const Text('匯入 YouTube 影片'),
               onTap: () {
                 Navigator.pop(context);
-                importYoutube(); // 呼叫我們剛剛寫好的 YT 匯入功能
+                importYoutube();
               },
             ),
           ],
@@ -1488,29 +1515,27 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    // 初始載入交給 GlobalManager
     GlobalManager.loadNotes();
   }
 
   Future<void> togglePin(MeetingNote note) async {
     note.isPinned = !note.isPinned;
-    await GlobalManager.saveNote(note); // 存檔後 GlobalManager 會自動推播更新
+    await GlobalManager.saveNote(note);
   }
 
   Future<void> deleteNote(String id) async {
-    await GlobalManager.deleteNote(id); // 刪除後 GlobalManager 會自動推播更新
+    await GlobalManager.deleteNote(id);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text("會議記錄列表"), centerTitle: true),
-      // --- 綁定 notesNotifier，只要資料庫有變更，這裡自動重繪！ ---
       body: ValueListenableBuilder<List<MeetingNote>>(
           valueListenable: GlobalManager.notesNotifier,
           builder: (context, notes, child) {
             return RefreshIndicator(
-              onRefresh: GlobalManager.loadNotes, // 下拉重整
+              onRefresh: GlobalManager.loadNotes,
               child: notes.isEmpty
                   ? const Center(child: Text("尚無紀錄，點擊下方 + 開始"))
                   : ListView.builder(
@@ -1527,7 +1552,6 @@ class _HomePageState extends State<HomePage> {
                                 const Icon(Icons.delete, color: Colors.white),
                           ),
                           direction: DismissDirection.endToStart,
-                          // --- 保留之前加入的確認刪除防呆 ---
                           confirmDismiss: (direction) async {
                             return await showDialog<bool>(
                               context: context,
@@ -1581,7 +1605,6 @@ class _HomePageState extends State<HomePage> {
                                     DateFormat('yyyy/MM/dd HH:mm')
                                         .format(note.date),
                                   ),
-                                  // --- 動態顯示分析與下載狀態 ---
                                   if ((note.status == NoteStatus.processing ||
                                           note.status ==
                                               NoteStatus.downloading) &&
@@ -1623,7 +1646,6 @@ class _HomePageState extends State<HomePage> {
                                         NoteDetailPage(note: note),
                                   ),
                                 );
-                                // 返回後自動刷新
                                 GlobalManager.loadNotes();
                               },
                             ),
@@ -1653,15 +1675,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
 
-  // 用於逐字稿捲動與高亮控制
   final ScrollController _transcriptScrollController = ScrollController();
   final Map<int, GlobalKey> _transcriptKeys = {};
   int _currentActiveTranscriptIndex = -1;
-
-  // 新增：紀錄被收合的章節標題
   final Set<String> _collapsedSections = {};
 
-  // --- 新增：多語系顯示開關 ---
   bool _showOriginal = true;
   bool _showPhonetic = true;
   bool _showTranslation = true;
@@ -1697,9 +1715,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       if (mounted) {
         setState(() => _position = p);
 
-        // --- 核心邏輯：自動高亮、自動展開與捲動 ---
         if (_tabController.index == 1 && _note.transcript.isNotEmpty) {
-          // 💡【修正 1】：使用毫秒換算為浮點數，解決整數秒 (inSeconds) 造成的延遲與不同步
           double currentSeconds = p.inMilliseconds / 1000.0;
           int newIndex = _note.transcript
               .lastIndexWhere((t) => currentSeconds >= t.startTime);
@@ -1708,7 +1724,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             setState(() {
               _currentActiveTranscriptIndex = newIndex;
 
-              // 若播放到了被收合的章節，自動將其展開
               try {
                 Section activeSec = _note.sections.lastWhere(
                     (s) => _note.transcript[newIndex].startTime >= s.startTime);
@@ -1718,15 +1733,14 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               } catch (e) {}
             });
 
-            // 使用 PostFrameCallback 確保 UI 渲染完成後才進行捲動，避免跳轉失敗
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (_transcriptKeys.containsKey(newIndex) &&
                   _transcriptKeys[newIndex]!.currentContext != null) {
                 Scrollable.ensureVisible(
                   _transcriptKeys[newIndex]!.currentContext!,
                   duration: const Duration(milliseconds: 300),
-                  alignment: 0.3, // 捲動到畫面約 30% 高度的位置
-                ).catchError((_) {}); // 忽略不可見時的錯誤
+                  alignment: 0.3,
+                ).catchError((_) {});
               }
             });
           }
@@ -1772,11 +1786,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     }
   }
 
-  // 修改：支援尚未點擊播放時的跳轉
   Future<void> _seekTo(double seconds) async {
     File actualFile = await GlobalManager.getActualFile(_note.audioPath);
     if (await actualFile.exists()) {
-      // 如果還沒有載入過音檔 (duration為0)，先預先載入來源，這樣跳轉才有效
       if (_duration == Duration.zero && !_isPlaying) {
         await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
       }
@@ -1784,7 +1796,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     }
   }
 
-  // 雙擊時直接跳轉並開始播放
   Future<void> _seekAndPlay(double seconds) async {
     File actualFile = await GlobalManager.getActualFile(_note.audioPath);
     if (await actualFile.exists()) {
@@ -1848,7 +1859,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             },
             child: const Text("基於逐字稿"),
           ),
-          // --- 新增：補全逐字稿選項 ---
           TextButton(
             onPressed: () {
               Navigator.pop(context);
@@ -1862,7 +1872,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             },
             child: const Text("補全缺漏段落", style: TextStyle(color: Colors.green)),
           ),
-          // ---------------------------
           TextButton(
             onPressed: () {
               Navigator.pop(context);
@@ -1996,8 +2005,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                 const Expanded(
                     child: Text("💡 提示：在上方框選文字後可加入字典，或點擊游標位置使用斷句功能。",
                         style: TextStyle(fontSize: 10, color: Colors.grey))),
-
-                // --- 核心修改：精確推算斷句時間 ---
                 IconButton(
                   icon: const Icon(Icons.call_split, color: Colors.blue),
                   tooltip: "從游標處斷開為兩句",
@@ -2007,11 +2014,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                       String part1 = controller.text.substring(0, pos).trim();
                       String part2 = controller.text.substring(pos).trim();
 
-                      // 💡【修正 2】：精確的時間內插法
                       double currentStartTime =
                           _note.transcript[index].startTime;
 
-                      // 以每字平均發音長度(約0.3秒)預估本句總時長，避免被後續的長時間靜音影響
                       double estimatedDuration = controller.text.length * 0.3;
                       double nextStartTime =
                           currentStartTime + estimatedDuration;
@@ -2019,13 +2024,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                       if (index + 1 < _note.transcript.length) {
                         double actualNextTime =
                             _note.transcript[index + 1].startTime;
-                        // 若下一句緊接著說，則以實際下一句的時間為界線；若中間停頓很久，則使用預估時長
                         if (actualNextTime < nextStartTime) {
                           nextStartTime = actualNextTime;
                         }
                       }
 
-                      // 根據切斷位置佔整句話的比例，推算第二句的起始時間
                       double ratio = pos / controller.text.length;
                       double newStartTime = currentStartTime +
                           ((nextStartTime - currentStartTime) * ratio);
@@ -2037,7 +2040,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                           TranscriptItem(
                             speaker: _note.transcript[index].speaker,
                             text: part2,
-                            // 取到小數點第一位，避免時間精度過長
                             startTime:
                                 double.parse(newStartTime.toStringAsFixed(1)),
                           ),
@@ -2053,7 +2055,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     }
                   },
                 ),
-
                 IconButton(
                   icon: const Icon(Icons.bookmark_add, color: Colors.orange),
                   tooltip: "將框選文字加入字典",
@@ -2097,14 +2098,12 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       final safeTitle = _note.title.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
       final file = File('${dir.path}/$safeTitle.$ext');
 
-      // --- 核心修正：強制寫入 UTF-8 BOM，徹底解決 Windows/Excel 開啟的亂碼問題 ---
       List<int> bytes = [];
       if (ext == 'csv' || ext == 'md') {
-        bytes.addAll([0xEF, 0xBB, 0xBF]); // 加入 UTF-8 BOM 標記
+        bytes.addAll([0xEF, 0xBB, 0xBF]);
       }
       bytes.addAll(utf8.encode(content));
       await file.writeAsBytes(bytes);
-      // -----------------------------------------------------------------------
 
       await Share.shareXFiles([XFile(file.path)],
           text: '會議記錄匯出: ${_note.title}');
@@ -2116,18 +2115,15 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   Future<void> _exportCsv() async {
     StringBuffer csv = StringBuffer();
-    // 寫入標題與日期
     csv.writeln("會議標題,${_note.title.replaceAll('"', '""')}");
     csv.writeln("會議日期,${DateFormat('yyyy/MM/dd HH:mm').format(_note.date)}\n");
 
-    // 寫入摘要
     csv.writeln("【重點摘要】");
     for (var s in _note.summary) {
       csv.writeln('"${s.replaceAll('"', '""')}"');
     }
     csv.writeln("");
 
-    // 寫入任務
     csv.writeln("【待辦事項】");
     csv.writeln("任務,負責人,期限");
     for (var t in _note.tasks) {
@@ -2136,12 +2132,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     }
     csv.writeln("");
 
-    // 寫入逐字稿
     csv.writeln("【逐字稿】");
     csv.writeln("時間,說話者,內容");
     for (var item in _note.transcript) {
-      String time = DateFormat('HH:mm:ss')
-          .format(DateTime(0).add(Duration(seconds: item.startTime.toInt())));
+      // 💡 修正：套用全域格式
+      String time = GlobalManager.formatTime(item.startTime);
       String text = item.text.replaceAll('"', '""');
       csv.writeln('$time,${item.speaker},"$text"');
     }
@@ -2164,8 +2159,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     }
     md.writeln("\n## 💬 逐字稿");
     for (var item in _note.transcript) {
-      String time = DateFormat('mm:ss')
-          .format(DateTime(0).add(Duration(seconds: item.startTime.toInt())));
+      // 💡 修正：套用全域格式
+      String time = GlobalManager.formatTime(item.startTime);
       md.writeln("**$time [${item.speaker}]**: ${item.text}\n");
     }
     await _exportFile('md', md.toString());
@@ -2173,21 +2168,16 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   Future<void> _generatePdf() async {
     final pdf = pw.Document();
-
-    // --- 1. 原本的字體 ---
     final fontRegular = await PdfGoogleFonts.notoSansTCRegular();
     final fontBold = await PdfGoogleFonts.notoSansTCBold();
-
-    // --- 2. 新增：載入韓文專用字體 ---
     final fontKorean = await PdfGoogleFonts.notoSansKRRegular();
 
     pdf.addPage(
       pw.MultiPage(
-        // --- 3. 修改：加入 fontFallback 陣列 ---
         theme: pw.ThemeData.withFont(
           base: fontRegular,
           bold: fontBold,
-          fontFallback: [fontKorean], // 👈 當 TC 找不到字時，自動用韓文字體補上
+          fontFallback: [fontKorean],
         ),
         build: (context) => [
           pw.Header(
@@ -2217,9 +2207,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                 children: [
                   pw.SizedBox(
                       width: 40,
-                      child: pw.Text(
-                          DateFormat('mm:ss').format(DateTime(0)
-                              .add(Duration(seconds: t.startTime.toInt()))),
+                      // 💡 修正：套用全域格式
+                      child: pw.Text(GlobalManager.formatTime(t.startTime),
                           style: const pw.TextStyle(color: PdfColors.grey))),
                   pw.SizedBox(
                       width: 60,
@@ -2323,8 +2312,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     onChanged: (v) => _seekTo(v),
                   ),
                 ),
+                // 💡 修正：音訊播放器也套用統一格式
                 Text(
-                    "${_position.inMinutes}:${(_position.inSeconds % 60).toString().padLeft(2, '0')} / ${_duration.inMinutes}:${(_duration.inSeconds % 60).toString().padLeft(2, '0')}"),
+                    "${GlobalManager.formatTime(_position.inSeconds.toDouble())} / ${GlobalManager.formatTime(_duration.inSeconds.toDouble())}"),
               ],
             ),
           ),
@@ -2412,9 +2402,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // --- 新增：智慧解析多語系文字並依開關顯示 ---
   Widget _buildParsedText(String text) {
-    // 如果不是外語三行格式，就當作一般中文直接顯示
     if (!text.contains('[原文]') &&
         !text.contains('[拼音]') &&
         !text.contains('[翻譯]')) {
@@ -2444,13 +2432,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               style: TextStyle(fontSize: 16, color: Colors.green.shade700)));
         }
       } else if (trimmed.isNotEmpty) {
-        // 捕捉 AI 偶爾多講的廢話或無標籤的句子
         widgets.add(Text(trimmed,
             style: TextStyle(fontSize: 16, color: Colors.green.shade700)));
       }
     }
 
-    // 如果使用者把三個開關都關掉，至少顯示個提示
     if (widgets.isEmpty) {
       return const Text("...", style: TextStyle(color: Colors.grey));
     }
@@ -2461,10 +2447,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // --- 改良版：帶有章節歸屬與動態高亮的逐字稿列表 ---
   Widget _buildTranscriptTab() {
     List<Widget> listItems = [];
-    // --- 新增：多語系顯示切換列 (置於逐字稿最上方) ---
     if (_note.transcript.isNotEmpty) {
       listItems.add(
         Container(
@@ -2509,28 +2493,22 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
     String? currentChapter;
 
-    // --- 新增：智慧大頭貼縮寫邏輯 ---
     String getSpeakerAvatarChar(String name) {
       if (name.isEmpty) return "?";
       String cleanName = name.trim();
 
-      // 1. 處理 "Speaker A", "Speaker B" -> 取最後的字母 A 或 B
       if (cleanName.toLowerCase().startsWith('speaker ')) {
         return cleanName.split(' ').last[0].toUpperCase();
       }
-      // 2. 處理中文名字 -> 取最後一個字 (如「家偉」->「偉」, 「李四」->「四」)
       if (RegExp(r'[\u4e00-\u9fa5]').hasMatch(cleanName) &&
           cleanName.length >= 2) {
         return cleanName.substring(cleanName.length - 1);
       }
-      // 3. 處理英文全名 -> 取最後一個單字的首字母 (如 "John Doe" -> "D")
       if (cleanName.contains(' ')) {
         return cleanName.split(' ').last[0].toUpperCase();
       }
-      // 4. 預設取第一個字
       return cleanName[0].toUpperCase();
     }
-    // ---------------------------------
 
     for (int i = 0; i < _note.transcript.length; i++) {
       final item = _note.transcript[i];
@@ -2542,7 +2520,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         sec = null;
       }
 
-      // 1. 章節標題
       if (sec != null && sec.title != currentChapter) {
         currentChapter = sec.title;
         bool isCollapsed = _collapsedSections.contains(currentChapter);
@@ -2578,7 +2555,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         );
       }
 
-      // 2. 被收合的章節隱藏對話
       if (sec != null && _collapsedSections.contains(sec.title)) {
         continue;
       }
@@ -2601,7 +2577,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                 children: [
                   InkWell(
                     onTap: () => _changeSpeaker(i),
-                    // --- 修改：套用智慧縮寫函數 ---
                     child: CircleAvatar(
                         child: Text(getSpeakerAvatarChar(item.speaker))),
                   ),
@@ -2616,15 +2591,14 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                                 fontSize: 12,
                                 color: Colors.blueGrey)),
                         const SizedBox(height: 4),
-                        // --- 核心修正：將原本單純的 Text 替換為支援開關的多語系文字解析器 ---
                         _buildParsedText(item.text),
                       ],
                     ),
                   ),
                   const SizedBox(width: 8),
+                  // 💡 修正：套用全域格式
                   Text(
-                    DateFormat('mm:ss').format(DateTime(0)
-                        .add(Duration(seconds: item.startTime.toInt()))),
+                    GlobalManager.formatTime(item.startTime),
                     style: const TextStyle(fontSize: 12, color: Colors.grey),
                   ),
                 ],
@@ -2635,7 +2609,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       );
     }
 
-    // 改用 SingleChildScrollView + Column 確保所有 GlobalKey 都有 Context，跳轉絕對不會失敗
     return SingleChildScrollView(
       controller: _transcriptScrollController,
       child: Column(
@@ -2654,25 +2627,22 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           child: ListTile(
             title: Text(section.title,
                 style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle:
-                Text("${(section.endTime - section.startTime).toInt()} 秒"),
+            // 💡 修正：使用自訂的全域格式顯示 開始與結束時間
+            subtitle: Text(
+                "${GlobalManager.formatTime(section.startTime)} - ${GlobalManager.formatTime(section.endTime)}"),
             leading: const Icon(Icons.bookmark),
             onTap: () {
-              // 1. 確保該章節已展開
               setState(() {
                 _collapsedSections.remove(section.title);
               });
 
-              // 2. 切換回「逐字稿」頁籤
               _tabController.animateTo(1);
 
-              // --- 核心修正：找出確切的逐字稿索引，等待 Tab 動畫完成後強制捲動 ---
               int targetIndex = _note.transcript
                   .indexWhere((t) => t.startTime >= section.startTime);
               if (targetIndex != -1) {
                 setState(() => _currentActiveTranscriptIndex = targetIndex);
 
-                // --- 核心修正：加入智慧重試機制與頂部聚焦對齊 ---
                 void tryScroll(int retries) {
                   if (!mounted) return;
                   final ctx = _transcriptKeys[targetIndex]?.currentContext;
@@ -2681,21 +2651,18 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     Scrollable.ensureVisible(
                       ctx,
                       duration: const Duration(milliseconds: 300),
-                      alignment: 0.1, // 改為 0.1，讓目標對話更靠近螢幕頂部，達成完美聚焦
+                      alignment: 0.1,
                     ).catchError((_) {});
                   } else if (retries > 0) {
-                    // 若 Context 還沒準備好 (Tab可能還在切換動畫)，延遲 100ms 後再次嘗試
                     Future.delayed(const Duration(milliseconds: 100),
                         () => tryScroll(retries - 1));
                   }
                 }
 
-                // 先給 100ms 讓 Tab 開始切換，接著最多自動重試 10 次 (約 1 秒)，保證捲動一定成功
                 Future.delayed(
                     const Duration(milliseconds: 100), () => tryScroll(10));
               }
 
-              // 3. 跳轉音訊並播放
               _seekAndPlay(section.startTime);
             },
           ),
@@ -2717,8 +2684,8 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _participantController = TextEditingController();
 
   String _selectedModel = 'gemini-flash-latest';
-  List<String> _models = ['gemini-flash-latest']; // 初始預設選項
-  bool _isLoadingModels = false; // 控制載入中動畫
+  List<String> _models = ['gemini-flash-latest'];
+  bool _isLoadingModels = false;
 
   @override
   void initState() {
@@ -2733,7 +2700,6 @@ class _SettingsPageState extends State<SettingsPage> {
       String savedModel =
           prefs.getString('model_name') ?? 'gemini-flash-latest';
 
-      // 防呆：確保儲存的模型存在於當前的清單中，否則 Dropdown 會報錯
       if (!_models.contains(savedModel)) {
         _models.add(savedModel);
       }
@@ -2741,7 +2707,6 @@ class _SettingsPageState extends State<SettingsPage> {
     });
   }
 
-  // --- 測試與載入模型邏輯 ---
   Future<void> _testAndLoadModels() async {
     final apiKey = _apiKeyController.text.trim();
     if (apiKey.isEmpty) {
@@ -2766,11 +2731,10 @@ class _SettingsPageState extends State<SettingsPage> {
 
       setState(() {
         _models = fetchedModels;
-        // 依照需求：優先預設為 gemini-flash-latest
         if (_models.contains('gemini-flash-latest')) {
           _selectedModel = 'gemini-flash-latest';
-        } else if (_models.contains('gemini-1.5-flash-latest')) {
-          _selectedModel = 'gemini-1.5-flash-latest';
+        } else if (_models.contains('gemini-2.0-flash')) {
+          _selectedModel = 'gemini-2.0-flash';
         } else {
           _selectedModel = _models.first;
         }
@@ -2782,7 +2746,6 @@ class _SettingsPageState extends State<SettingsPage> {
             backgroundColor: Colors.green),
       );
 
-      // 測試成功順便存檔
       _saveSettings();
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2837,8 +2800,6 @@ class _SettingsPageState extends State<SettingsPage> {
             obscureText: true,
           ),
           const SizedBox(height: 10),
-
-          // --- 測試 API Key 的按鈕 ---
           ElevatedButton.icon(
             onPressed: _isLoadingModels ? null : _testAndLoadModels,
             icon: _isLoadingModels
@@ -2854,8 +2815,6 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 10),
-
-          // 使用 InputDecorator + DropdownButton 完美避開棄用警告，且支援動態更新
           InputDecorator(
             decoration: const InputDecoration(labelText: "選擇 AI 模型"),
             child: DropdownButtonHideUnderline(
@@ -2870,7 +2829,6 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 20),
-
           const Text(
             "預設與會者 (常用名單)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -2962,7 +2920,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-// --- 日誌檢視頁面 (增強版：加入分享功能) ---
 class LogViewerPage extends StatelessWidget {
   const LogViewerPage({super.key});
 
@@ -2972,14 +2929,12 @@ class LogViewerPage extends StatelessWidget {
       appBar: AppBar(
         title: const Text("系統日誌 (Debug)"),
         actions: [
-          // 1. 清除按鈕
           IconButton(
             icon: const Icon(Icons.delete),
             onPressed: () {
-              GlobalManager.logsNotifier.value = []; // 清空日誌
+              GlobalManager.logsNotifier.value = [];
             },
           ),
-          // 2. 分享按鈕
           IconButton(
             icon: const Icon(Icons.share),
             onPressed: () async {
@@ -2991,15 +2946,9 @@ class LogViewerPage extends StatelessWidget {
                   );
                   return;
                 }
-
-                // 取得暫存目錄
                 final dir = await getTemporaryDirectory();
                 final file = File('${dir.path}/app_debug_log.txt');
-
-                // 寫入檔案
                 await file.writeAsString(text);
-
-                // 呼叫系統分享
                 await Share.shareXFiles([XFile(file.path)],
                     text: 'Meeting Recorder Debug Log');
               } catch (e) {
@@ -3009,7 +2958,6 @@ class LogViewerPage extends StatelessWidget {
               }
             },
           ),
-          // 3. 複製按鈕
           IconButton(
             icon: const Icon(Icons.copy),
             onPressed: () {
@@ -3022,7 +2970,7 @@ class LogViewerPage extends StatelessWidget {
           ),
         ],
       ),
-      backgroundColor: Colors.black, // 黑底更有工程師感
+      backgroundColor: Colors.black,
       body: ValueListenableBuilder<List<String>>(
         valueListenable: GlobalManager.logsNotifier,
         builder: (context, logs, child) {
@@ -3037,14 +2985,15 @@ class LogViewerPage extends StatelessWidget {
                 const Divider(color: Colors.white24, height: 1),
             itemBuilder: (context, index) {
               final log = logs[index];
-              Color textColor = Colors.greenAccent; // 一般訊息顏色
+              Color textColor = Colors.greenAccent;
               if (log.contains("❌") ||
                   log.contains("失敗") ||
                   log.contains("Error") ||
-                  log.contains("Exception")) {
-                textColor = Colors.redAccent; // 錯誤訊息顏色
+                  log.contains("Exception") ||
+                  log.contains("⚠️")) {
+                textColor = Colors.redAccent;
               } else if (log.contains("Step") || log.contains("準備")) {
-                textColor = Colors.yellowAccent; // 步驟顏色
+                textColor = Colors.yellowAccent;
               }
 
               return SelectableText(
