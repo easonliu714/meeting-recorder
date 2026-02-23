@@ -438,21 +438,32 @@ class GlobalManager {
   static final ValueNotifier<List<MeetingNote>> notesNotifier =
       ValueNotifier([]);
 
-  static void addLog(String message) {
+  // --- 修改：加入儲存日誌的邏輯 ---
+  static void addLog(String message) async {
     final time = DateFormat('HH:mm:ss').format(DateTime.now());
     final newLog = "[$time] [APP] $message";
     final currentLogs = logsNotifier.value;
-    logsNotifier.value = currentLogs.length > 500
+
+    // 限制最多存 500 筆，避免日誌無限膨脹塞爆儲存空間
+    final updatedLogs = currentLogs.length > 500
         ? [newLog, ...currentLogs.take(499)]
         : [newLog, ...currentLogs];
+
+    logsNotifier.value = updatedLogs;
     print(newLog);
+
+    // 同步寫入 SharedPreferences
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('app_logs', updatedLogs);
   }
 
+  // --- 修改：初始化時載入歷史日誌 ---
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
     participantListNotifier.value =
         prefs.getStringList('participant_list') ?? [];
+    logsNotifier.value = prefs.getStringList('app_logs') ?? []; // 載入日誌
     await loadNotes(); // 初始化時自動載入一次筆記
   }
 
@@ -872,8 +883,9 @@ class _MainAppShellState extends State<MainAppShell> {
           sampleRate: 44100, // 標準音訊採樣率
           numChannels: 1, // 【關鍵】設定為單聲道 (Mono) 更利於 AI 語音辨識
           autoGain: true, // 【關鍵】開啟自動增益：讓小聲說話的人變大聲
-          echoCancel: true, // 【關鍵】開啟回音消除：減少空曠會議室的回音
-          noiseSuppress: true, // 【關鍵】開啟硬體降噪：過濾冷氣聲、風聲等背景底噪
+          echoCancel: false, // 💡【關鍵修正 3】關閉硬體回音消除：防止演算法將微弱尾音誤判為回音而截斷
+          noiseSuppress:
+              false, // 💡【關鍵修正 4】關閉硬體降噪：防止降噪閥值過高(Noise Gate)吃掉較小聲的發言。Gemini 模型本身抗噪能力強，保留原始聲音細節給 AI 處理更好。
         ),
         path: path,
       );
@@ -993,9 +1005,29 @@ class _MainAppShellState extends State<MainAppShell> {
 
         DateTime fileDate = DateTime.now();
         try {
+          // 1. 先嘗試取得作業系統給的檔案最後修改時間 (通常是快取建立時間)
           fileDate = await file.lastModified();
+
+          // 2. 智慧檔名解析防呆機制：
+          // 如果修改時間跟現在相差不到 5 分鐘，代表這極可能是 OS 剛複製的快取檔
+          if (DateTime.now().difference(fileDate).inMinutes < 5) {
+            String fileName = result.files.single.name;
+            // 正則匹配常見錄音檔名格式：YYYYMMDD_HHMMSS 或 YYYY-MM-DD
+            RegExp regExp = RegExp(
+                r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})');
+            var match = regExp.firstMatch(fileName);
+            if (match != null) {
+              int y = int.parse(match.group(1)!);
+              int m = int.parse(match.group(2)!);
+              int d = int.parse(match.group(3)!);
+              int h = int.parse(match.group(4)!);
+              int min = int.parse(match.group(5)!);
+              fileDate = DateTime(y, m, d, h, min);
+              GlobalManager.addLog("從檔名成功解析真實錄音時間: $fileDate");
+            }
+          }
         } catch (e) {
-          print("無法取得檔案時間: $e");
+          GlobalManager.addLog("取得檔案時間失敗: $e");
         }
 
         createNewNoteAndAnalyze(file.path, "匯入錄音", date: fileDate);
@@ -1062,7 +1094,7 @@ class _MainAppShellState extends State<MainAppShell> {
         var audioStreams = manifest.audioOnly.sortByBitrate().toList();
 
         File? audioFile;
-        // --- 核心修正：自動迴圈嘗試各種可用串流，對抗 DNS 與被阻擋的來源 ---
+        // 強化容錯：拉長 Timeout，並攔截特定網路阻擋錯誤
         for (var streamInfo in audioStreams) {
           try {
             var stream = yt.videos.streamsClient.get(streamInfo);
@@ -1070,18 +1102,17 @@ class _MainAppShellState extends State<MainAppShell> {
             audioFile = File('${dir.path}/${video.id}.mp4');
             var fileStream = audioFile.openWrite();
 
-            // 加上 timeout：如果 45 秒內沒下載完就強制切斷，嘗試下一個來源！
-            await stream.pipe(fileStream).timeout(const Duration(seconds: 45));
+            // 拉長至 60 秒，應付較大檔案與降速限制
+            await stream.pipe(fileStream).timeout(const Duration(seconds: 60));
             await fileStream.flush();
             await fileStream.close();
-            break; // 成功下載即跳出
+            break;
           } catch (e) {
-            GlobalManager.addLog("YT音訊串流失敗，嘗試下一個: $e");
+            GlobalManager.addLog("YT純音訊串流失敗 (嘗試備案): $e");
             audioFile = null;
           }
         }
 
-        // 若純音訊都失敗，改拿包含影像的串流做備用
         if (audioFile == null) {
           GlobalManager.addLog("所有純音訊失敗，嘗試備用綜合串流...");
           var muxedStreams = manifest.muxed.sortByBitrate().toList();
@@ -1092,23 +1123,24 @@ class _MainAppShellState extends State<MainAppShell> {
               audioFile = File('${dir.path}/${video.id}.mp4');
               var fileStream = audioFile.openWrite();
 
+              // 影音檔較大，給予 90 秒
               await stream
                   .pipe(fileStream)
-                  .timeout(const Duration(seconds: 60)); // 影音檔較大，給 60 秒
+                  .timeout(const Duration(seconds: 90));
               await fileStream.flush();
               await fileStream.close();
               break;
             } catch (e) {
-              GlobalManager.addLog("備用串流失敗或超時: $e");
+              GlobalManager.addLog("YT備用串流失敗: $e");
               audioFile = null;
             }
           }
         }
 
         if (audioFile == null || !(await audioFile.exists())) {
-          throw Exception("無法下載該影片，來源可能受到地區或版權限制。");
+          // 明確拋出例外讓 catch 區塊接手
+          throw Exception("下載失敗。可能受到 YouTube 機器人防護阻擋或 DNS 污染。");
         }
-        // -----------------------------------------------------------
 
         note.audioPath = audioFile.path;
         note.currentStep = '準備進行 AI 分析...';
@@ -1116,14 +1148,22 @@ class _MainAppShellState extends State<MainAppShell> {
 
         GlobalManager.analyzeNote(note);
       } catch (e) {
-        GlobalManager.addLog("YT處理失敗: $e");
+        String errorMsg = e.toString();
+        // 偵測是否為 YouTube 的節點封鎖 (如您日誌中的 SocketException)
+        if (errorMsg.contains("SocketException") ||
+            errorMsg.contains("host lookup")) {
+          errorMsg = "YouTube 伺服器節點阻擋 (防抓取機制)。建議先使用外部工具下載為 MP3 後再匯入。";
+        }
+
+        GlobalManager.addLog("YT處理最終失敗: $errorMsg");
         note.status = NoteStatus.failed;
-        note.summary = ["下載失敗: $e\n(請檢查網路連線或影片版權限制)"];
+        note.summary = ["下載失敗:\n$errorMsg"];
         note.currentStep = '';
         await GlobalManager.saveNote(note);
         if (mounted) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text("YouTube 載入失敗: $e")));
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text("YouTube 載入失敗，請查看紀錄了解詳情"),
+              backgroundColor: Colors.red));
         }
       } finally {
         yt.close();
@@ -1492,8 +1532,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
         // --- 核心邏輯：自動高亮、自動展開與捲動 ---
         if (_tabController.index == 1 && _note.transcript.isNotEmpty) {
+          // 💡【修正 1】：使用毫秒換算為浮點數，解決整數秒 (inSeconds) 造成的延遲與不同步
+          double currentSeconds = p.inMilliseconds / 1000.0;
           int newIndex = _note.transcript
-              .lastIndexWhere((t) => p.inSeconds >= t.startTime);
+              .lastIndexWhere((t) => currentSeconds >= t.startTime);
+
           if (newIndex != -1 && newIndex != _currentActiveTranscriptIndex) {
             setState(() {
               _currentActiveTranscriptIndex = newIndex;
@@ -1772,7 +1815,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     child: Text("💡 提示：在上方框選文字後可加入字典，或點擊游標位置使用斷句功能。",
                         style: TextStyle(fontSize: 10, color: Colors.grey))),
 
-                // --- 修改：游標斷句按鈕 (加入智慧時間推算) ---
+                // --- 核心修改：精確推算斷句時間 ---
                 IconButton(
                   icon: const Icon(Icons.call_split, color: Colors.blue),
                   tooltip: "從游標處斷開為兩句",
@@ -1782,13 +1825,22 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                       String part1 = controller.text.substring(0, pos).trim();
                       String part2 = controller.text.substring(pos).trim();
 
-                      // --- 核心修改：智慧計算新秒數 ---
+                      // 💡【修正 2】：精確的時間內插法
                       double currentStartTime =
                           _note.transcript[index].startTime;
-                      // 取得下一句的時間，如果沒有下一句，就預設加 5 秒
-                      double nextStartTime = currentStartTime + 5.0;
+
+                      // 以每字平均發音長度(約0.3秒)預估本句總時長，避免被後續的長時間靜音影響
+                      double estimatedDuration = controller.text.length * 0.3;
+                      double nextStartTime =
+                          currentStartTime + estimatedDuration;
+
                       if (index + 1 < _note.transcript.length) {
-                        nextStartTime = _note.transcript[index + 1].startTime;
+                        double actualNextTime =
+                            _note.transcript[index + 1].startTime;
+                        // 若下一句緊接著說，則以實際下一句的時間為界線；若中間停頓很久，則使用預估時長
+                        if (actualNextTime < nextStartTime) {
+                          nextStartTime = actualNextTime;
+                        }
                       }
 
                       // 根據切斷位置佔整句話的比例，推算第二句的起始時間
@@ -1803,7 +1855,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                           TranscriptItem(
                             speaker: _note.transcript[index].speaker,
                             text: part2,
-                            // 將計算出的新時間，取到小數點第一位
+                            // 取到小數點第一位，避免時間精度過長
                             startTime:
                                 double.parse(newStartTime.toStringAsFixed(1)),
                           ),
@@ -1812,7 +1864,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                       _saveNoteUpdate();
                       Navigator.pop(dialogContext);
                       ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text("已斷開並自動推算新時間！")));
+                          const SnackBar(content: Text("已斷開並自動推算精準新時間！")));
                     } else {
                       ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(content: Text("請先點擊文字內容，指定要斷句的游標位置")));
@@ -2241,9 +2293,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             spacing: 8,
             children: [
               const Icon(Icons.g_translate, size: 18, color: Colors.blueGrey),
-              const Text("多語系顯示：",
+              const Text("多語系：",
                   style: TextStyle(
-                      fontSize: 14,
+                      fontSize: 12,
                       color: Colors.blueGrey,
                       fontWeight: FontWeight.bold)),
               FilterChip(
