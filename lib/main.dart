@@ -650,8 +650,8 @@ class GlobalManager {
       final duration = await tempPlayer.getDuration();
       await tempPlayer.dispose();
 
-      // 💡【核心修正 1】：將切片長度從 600 秒縮短為 300 秒 (5分鐘)，大幅減少 AI 時間軸偏移
-      final int chunkSize = 300;
+      // 💡【核心修正 1】：將切片長度從 600 秒縮短為 120 秒 (2分鐘)，大幅減少 AI 時間軸偏移
+      final int chunkSize = 120;
 
       double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
       if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
@@ -730,12 +730,16 @@ class GlobalManager {
         請扮演一位極度專業的「逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
         
         【最高指導原則】：
-        1. 嚴禁憑空捏造！若該段時間無人說話、只有環境音，請直接回傳空陣列 []。
-        2. 忠實還原：請勿擅自摘要、潤飾或刪減對話。即便是贅詞、停頓語氣也請盡量保留。
-        3. 精準辨識講者：請敏銳地根據音色、語氣、遠近與對話輪替，嚴格區分不同的說話者。
-        4. 【強制細部分段 (防止時間軸偏移) - 極度重要】：若單一講者連續發言，請「強制」每講完 1~2 句話（或大約每 10~15 秒）就斷開產生一筆新的 JSON，並重新對齊精準的 `startTime`。絕對禁止將長達數十秒的對話合併成單一 JSON 節點！
-        5. 【時間戳嚴格校準】：startTime 必須與音訊實際發生的秒數完全吻合（落在 $chunkStart 到 $chunkEnd 之間），嚴禁擅自偏移、延遲或捏造。
-        
+        1. 嚴禁憑空捏造！若該段時間完全無對話，請回傳 []。
+        2. 精準辨識講者：請敏銳地根據音色、語氣嚴格區分不同的說話者。
+        3. 【強制短句斷點】：只要講者稍微停頓換氣，或是單一句子長度超過 10 秒，你「必須」立刻斷開，產生一個新的 JSON 節點並重新標記 startTime。絕對禁止將超過 15 秒的語音合併在同一個 text 中！
+        4. 【防範時間軸偏移 (Time Drift) 專用指令 - 極度重要】：
+           如果你在音訊中遇到「超過 5 秒的無聲、背景雜音、音樂或無人講話的空白」，你「絕對不能直接跳過」！
+           你必須強制插入一個系統節點來校準時間，格式如下：
+           {"speaker": "System", "text": "[沉默或雜音]", "startTime": 實際沉默開始的秒數}
+           有了這個節點，你才能準確推算下一句對話的真實 startTime，嚴禁把遙遠未來的對話時間往前拉！
+        5. 【時間戳嚴格校準】：所有的 startTime 必須與實際發生的秒數完全吻合（落在 $chunkStart 到 $chunkEnd 之間）。
+
         【多語系與翻譯規則】(極重要)：
         1. 若對話中僅夾雜「非中文單字/詞彙」，請保留原文，並在後方用括號附上繁體中文翻譯。範例：「這個 project (專案) 要確認。」
         2. 若「整句話」都是非中文（如全日文、全韓文、全英文），請務必嚴格依照以下「三行格式」輸出，不要省略任何一行：
@@ -810,8 +814,8 @@ class GlobalManager {
       final duration = await tempPlayer.getDuration();
       await tempPlayer.dispose();
 
-      // 💡 同步縮短為 300 秒 (5分鐘)
-      final int chunkSize = 300;
+      // 💡 同步縮短為 120 秒 (2分鐘)
+      final int chunkSize = 120;
 
       double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
       if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
@@ -865,13 +869,24 @@ class GlobalManager {
         預設與會者名單：${participantList.join(', ')}
         
         【最高指導原則】：
-        1. 嚴禁憑空捏造！若無對話請回傳 []。
-        2. 【強制細部分段 (防止時間軸偏移)】：若單一講者連續發言，請「強制」每講完 1~2 句話（或大約每 10~15 秒）就斷開產生一筆新的 JSON。絕對禁止將長達數十秒的對話合併成單一 JSON 節點！
-        3. 【時間戳嚴格校準】：所有的 startTime 必須是基於音檔開頭的「絕對秒數」（例如必須大於 $lastTime，且嚴格對齊語音實際發生的秒數）。
-        4. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
+        1. 嚴禁憑空捏造！若該段時間完全無對話，請回傳 []。
+        2. 精準辨識講者：請敏銳地根據音色、語氣嚴格區分不同的說話者。
+        3. 【強制短句斷點】：只要講者稍微停頓換氣，或是單一句子長度超過 10 秒，你「必須」立刻斷開，產生一個新的 JSON 節點並重新標記 startTime。絕對禁止將超過 15 秒的語音合併在同一個 text 中！
+        4. 【防範時間軸偏移 (Time Drift) 專用指令 - 極度重要】：
+           如果你在音訊中遇到「超過 5 秒的無聲、背景雜音、音樂或無人講話的空白」，你「絕對不能直接跳過」！
+           你必須強制插入一個系統節點來校準時間，格式如下：
+           {"speaker": "System", "text": "[沉默或雜音]", "startTime": 實際沉默開始的秒數}
+           有了這個節點，你才能準確推算下一句對話的真實 startTime，嚴禁把遙遠未來的對話時間往前拉！
+        5. 【時間戳嚴格校準】：所有的 startTime 必須與實際發生的秒數完全吻合（落在 $chunkStart 到 $chunkEnd 之間）。
         
+        【多語系規則】：若整句話是非中文，請提供 [原文]、[拼音]、[翻譯] 三行格式。
+
         回傳純 JSON 陣列格式範例：
-        [{"speaker":"A", "text":"你好", "startTime": 12.5}]
+        [
+          {"speaker":"A", "text":"好的，我們開始。", "startTime": 12.5},
+          {"speaker":"System", "text":"[沉默或雜音]", "startTime": 15.0},
+          {"speaker":"B", "text":"關於剛剛提的案子...", "startTime": 71.2}
+        ]
         """;
 
         try {
