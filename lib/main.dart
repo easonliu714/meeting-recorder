@@ -594,7 +594,7 @@ class GlobalManager {
   // --- AI 分析核心 (強烈約束防幻覺版) ---
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
-    note.currentStep = "準備上傳檔案...";
+    note.currentStep = "準備讀取音檔...";
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
@@ -611,6 +611,18 @@ class GlobalManager {
       if (!await audioFile.exists()) {
         throw Exception("找不到音訊檔案: ${note.audioPath}");
       }
+
+      // 💡【核心修正 1】：精準取得本地音檔真實長度
+      final tempPlayer = AudioPlayer();
+      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
+      final duration = await tempPlayer.getDuration();
+      await tempPlayer.dispose();
+
+      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      if (totalSeconds <= 0) totalSeconds = 600.0 * 18;
+
+      int maxChunks = (totalSeconds / 600).ceil();
+      if (maxChunks == 0) maxChunks = 1;
 
       _log("開始 Multipart 上傳...");
       note.currentStep = "上傳音訊檔案中...";
@@ -662,19 +674,11 @@ class GlobalManager {
               .toList() ??
           [];
 
-      double totalDuration = 600.0;
-      var td = overviewJson['totalDuration'];
-      if (td is num) {
-        totalDuration = td.toDouble();
-      } else if (td is String) totalDuration = double.tryParse(td) ?? 600.0;
-
-      // --- 核心修正：移除對 AI 預估時間的依賴，改用連續空訊號判定結束 ---
       List<TranscriptItem> fullTranscript = [];
       int emptyCount = 0;
-      int maxChunks = 18; // 最高支援到 3 小時 (18 個 10分鐘分段)
 
       for (int i = 0; i < maxChunks; i++) {
-        note.currentStep = "分析逐字稿 (${i + 1}/未定)...";
+        note.currentStep = "分析逐字稿 (${i + 1}/$maxChunks)..."; // 💡 UI 精準顯示進度
         await saveNote(note);
         _log(note.currentStep);
 
@@ -708,7 +712,6 @@ class GlobalManager {
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
         """;
 
-        // --- 核心修改：移除舊版寫死的迴圈，現在由 GeminiRestApi 智慧處理重試 ---
         try {
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
@@ -716,17 +719,16 @@ class GlobalManager {
 
           if (chunkList.isEmpty) {
             emptyCount++;
-            if (emptyCount >= 2) {
-              _log("連續兩個分段未偵測到對話，判定音檔結束。");
-              break; // 連續兩段無聲，跳出迴圈
-            }
+            if (emptyCount >= 2) break;
           } else {
-            emptyCount = 0; // 有對話則重置計數器
+            emptyCount = 0;
             fullTranscript.addAll(
                 chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
           }
         } catch (e) {
           _log("分段 $i 最終分析失敗: $e");
+          _log("⚠️ 遇到嚴重例外，終止後續分段提取以保護應用程序。");
+          break; // 💡【核心修正 3】：中斷迴圈
         }
 
         if (i < maxChunks - 1) {
@@ -743,20 +745,21 @@ class GlobalManager {
       _log("分析流程錯誤: $e");
       note.status = NoteStatus.failed;
       note.summary = ["分析失敗: $e"];
-      note.currentStep = ''; // 清空狀態
+      note.currentStep = '';
       await saveNote(note);
     }
   }
 
-// --- 新增：從目前中斷的地方繼續補全逐字稿 ---
+  // --- 新增：從目前中斷的地方繼續補全逐字稿 ---
   static Future<void> completeMissingTranscript(MeetingNote note) async {
     note.status = NoteStatus.processing;
-    note.currentStep = "準備上傳檔案以補全逐字稿...";
+    note.currentStep = "準備讀取音檔與上傳...";
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
+    final modelName =
+        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -764,28 +767,49 @@ class GlobalManager {
       if (apiKey.isEmpty) throw Exception("請先設定 API Key");
 
       final audioFile = await getActualFile(note.audioPath);
+
+      // 💡【核心修正 1】：精準取得本地音檔的真實長度
+      final tempPlayer = AudioPlayer();
+      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
+      final duration = await tempPlayer.getDuration();
+      await tempPlayer.dispose();
+
+      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      if (totalSeconds <= 0) totalSeconds = 600.0 * 18; // 備用防呆：最多3小時
+
+      int maxChunks = (totalSeconds / 600).ceil();
+      if (maxChunks == 0) maxChunks = 1;
+
+      // 取得目前逐字稿的最後時間
+      double lastTime =
+          note.transcript.isEmpty ? 0.0 : note.transcript.last.startTime;
+      int startChunk = (lastTime / 600).floor();
+
+      // 防呆：如果逐字稿已經超過音檔總長度
+      if (startChunk >= maxChunks) {
+        _log("逐字稿已達音檔結尾，無需補全。");
+        await reSummarizeFromTranscript(note);
+        return;
+      }
+
+      // --- 上傳檔案 ---
       final fileInfo = await GeminiRestApi.uploadFile(
           apiKey, audioFile, 'audio/mp4', note.title);
       final String fileUri = fileInfo['uri'];
       final String fileName = fileInfo['name'].split('/').last;
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
-      // 取得目前逐字稿的最後時間
-      double lastTime =
-          note.transcript.isEmpty ? 0.0 : note.transcript.last.startTime;
-      int startChunk = (lastTime / 600).floor();
       int emptyCount = 0;
-      int maxChunks = 18;
 
       for (int i = startChunk; i < maxChunks; i++) {
-        note.currentStep = "補全逐字稿 (${i + 1}/未定)...";
+        // 💡【核心修正 2】：UI 顯示精確的總段數，例如 (2/3)
+        note.currentStep = "補全逐字稿 (${i + 1}/$maxChunks)...";
         await saveNote(note);
         _log(note.currentStep);
 
         double chunkStart = (i * 600).toDouble();
         double chunkEnd = ((i + 1) * 600).toDouble();
 
-        // 告訴 AI 從哪裡開始聽，避免重複
         String extraInstruction = i == startChunk
             ? "特別注意：請直接從 $lastTime 秒開始聽打，忽略 $lastTime 秒之前的內容。"
             : "";
@@ -804,7 +828,6 @@ class GlobalManager {
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
         """;
 
-        // --- 核心修正：加入 try-catch 隔離單一分段的失敗 ---
         try {
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
@@ -812,7 +835,7 @@ class GlobalManager {
 
           if (chunkList.isEmpty) {
             emptyCount++;
-            if (emptyCount >= 2) break;
+            if (emptyCount >= 2) break; // 連續兩段無聲，提早結束
           } else {
             emptyCount = 0;
             var newItems = chunkList
@@ -823,7 +846,9 @@ class GlobalManager {
           }
         } catch (e) {
           _log("分段 $i 補全失敗: $e");
-          // 容許單段失敗，系統會記錄錯誤但「繼續執行下一個 10 分鐘區塊」
+          // 💡【核心修正 3】：遇到嚴重連線錯誤，中斷整個迴圈，不浪費時間測試下一段
+          _log("⚠️ 檢測到嚴重異常，終止後續分析以保護進度。");
+          break;
         }
 
         if (i < maxChunks - 1) {
@@ -831,10 +856,9 @@ class GlobalManager {
         }
       }
 
-      // 補全完畢後，直接呼叫重新摘要功能
       await reSummarizeFromTranscript(note);
     } catch (e) {
-      _log("補全失敗: $e");
+      _log("補全流程發生嚴重錯誤: $e");
       note.status = NoteStatus.failed;
       note.summary.insert(0, "補全失敗: $e");
       note.currentStep = '';
