@@ -291,56 +291,68 @@ class GeminiRestApi {
     while (true) {
       if (retryCount == 0) _log('發送 Prompt 至模型: $modelName');
 
-      final response = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'contents': [
-            {
-              'parts': [
-                {'text': prompt},
-                {
-                  'file_data': {'mime_type': mimeType, 'file_uri': fileUri}
-                }
-              ]
-            }
-          ],
-          'generationConfig': {'responseMimeType': 'application/json'}
-        }),
-      );
-
-      // --- 核心修改：智慧擷取 Google 要求的等待時間並自動重試 ---
-      if (response.statusCode == 429 && retryCount < maxRetries) {
-        double waitSeconds = 20.0;
-        // 透過正規表達式精準抓出 "retry in 47.5s." 的數字
-        final match =
-            RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
-        if (match != null && match.group(1) != null) {
-          waitSeconds = double.parse(match.group(1)!) + 3.0; // 多加 3 秒緩衝，確保解鎖
-        } else {
-          waitSeconds = 20.0 * (retryCount + 1); // 備用機制
-        }
-        _log(
-            "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
-        await Future.delayed(Duration(seconds: waitSeconds.toInt()));
-        retryCount++;
-        continue; // 重新執行 while 迴圈發送請求
-      }
-
-      if (response.statusCode != 200) {
-        throw Exception('Generate content failed: ${response.body}');
-      }
-
       try {
+        // --- 加入 120 秒超時保護 ---
+        final response = await http
+            .post(
+              url,
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'contents': [
+                  {
+                    'parts': [
+                      {'text': prompt},
+                      {
+                        'file_data': {
+                          'mime_type': mimeType,
+                          'file_uri': fileUri
+                        }
+                      }
+                    ]
+                  }
+                ],
+                'generationConfig': {'responseMimeType': 'application/json'}
+              }),
+            )
+            .timeout(const Duration(seconds: 120));
+
+        if (response.statusCode == 429 && retryCount < maxRetries) {
+          double waitSeconds = 20.0;
+          final match =
+              RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
+          if (match != null && match.group(1) != null) {
+            waitSeconds = double.parse(match.group(1)!) + 3.0;
+          } else {
+            waitSeconds = 20.0 * (retryCount + 1);
+          }
+          _log(
+              "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
+          await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+          retryCount++;
+          continue;
+        }
+
+        if (response.statusCode != 200) {
+          throw Exception('Generate content failed: ${response.body}');
+        }
+
         return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
             ['text'];
       } catch (e) {
-        throw Exception('Unexpected response format: ${response.body}');
+        // --- 核心修正：攔截網路中斷 (ClientException/SocketException) 並觸發重試 ---
+        if (retryCount < maxRetries &&
+            !e.toString().contains('Generate content failed')) {
+          _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試 (第 ${retryCount + 1} 次)...");
+          await Future.delayed(const Duration(seconds: 5));
+          retryCount++;
+          continue;
+        }
+        throw Exception('API 請求最終失敗: $e');
       }
     }
   }
 
-  // --- 純文字分析 (用於基於修改後逐字稿重新摘要) ---
+// --- 純文字分析 (用於基於修改後逐字稿重新摘要) ---
   static Future<String> generateTextOnly(
       String apiKey, String modelName, String prompt) async {
     final url = Uri.parse(
@@ -352,47 +364,57 @@ class GeminiRestApi {
     while (true) {
       if (retryCount == 0) _log('發送純文字 Prompt 至模型: $modelName');
 
-      final response = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'contents': [
-            {
-              'parts': [
-                {'text': prompt}
-              ]
-            }
-          ],
-          'generationConfig': {'responseMimeType': 'application/json'}
-        }),
-      );
-
-      // --- 核心修改：智慧擷取 Google 要求的等待時間並自動重試 ---
-      if (response.statusCode == 429 && retryCount < maxRetries) {
-        double waitSeconds = 20.0;
-        final match =
-            RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
-        if (match != null && match.group(1) != null) {
-          waitSeconds = double.parse(match.group(1)!) + 3.0;
-        } else {
-          waitSeconds = 20.0 * (retryCount + 1);
-        }
-        _log(
-            "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
-        await Future.delayed(Duration(seconds: waitSeconds.toInt()));
-        retryCount++;
-        continue;
-      }
-
-      if (response.statusCode != 200) {
-        throw Exception('Generate text failed: ${response.body}');
-      }
-
       try {
+        // --- 加入 120 秒超時保護 ---
+        final response = await http
+            .post(
+              url,
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'contents': [
+                  {
+                    'parts': [
+                      {'text': prompt} // 👈 核心修正：純文字分析只傳送 prompt，不包含 file_data
+                    ]
+                  }
+                ],
+                'generationConfig': {'responseMimeType': 'application/json'}
+              }),
+            )
+            .timeout(const Duration(seconds: 120));
+
+        if (response.statusCode == 429 && retryCount < maxRetries) {
+          double waitSeconds = 20.0;
+          final match =
+              RegExp(r'retry in (\d+(?:\.\d+)?)s').firstMatch(response.body);
+          if (match != null && match.group(1) != null) {
+            waitSeconds = double.parse(match.group(1)!) + 3.0;
+          } else {
+            waitSeconds = 20.0 * (retryCount + 1);
+          }
+          _log(
+              "⚠️ 觸發 API 頻率限制 (429)，自動等待 ${waitSeconds.toInt()} 秒後重試 (第 ${retryCount + 1} 次)...");
+          await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+          retryCount++;
+          continue;
+        }
+
+        if (response.statusCode != 200) {
+          throw Exception('Generate content failed: ${response.body}');
+        }
+
         return jsonDecode(response.body)['candidates'][0]['content']['parts'][0]
             ['text'];
       } catch (e) {
-        throw Exception('Unexpected response format: ${response.body}');
+        // --- 核心修正：攔截網路中斷 (ClientException/SocketException) 並觸發重試 ---
+        if (retryCount < maxRetries &&
+            !e.toString().contains('Generate content failed')) {
+          _log("⚠️ 網路連線異常 ($e)，自動等待 5 秒後重試 (第 ${retryCount + 1} 次)...");
+          await Future.delayed(const Duration(seconds: 5));
+          retryCount++;
+          continue;
+        }
+        throw Exception('API 請求最終失敗: $e');
       }
     }
   }
@@ -782,21 +804,26 @@ class GlobalManager {
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
         """;
 
-        final chunkResponseText = await GeminiRestApi.generateContent(
-            apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
-        final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
+        // --- 核心修正：加入 try-catch 隔離單一分段的失敗 ---
+        try {
+          final chunkResponseText = await GeminiRestApi.generateContent(
+              apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
+          final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
 
-        if (chunkList.isEmpty) {
-          emptyCount++;
-          if (emptyCount >= 2) break;
-        } else {
-          emptyCount = 0;
-          // 過濾掉時間重疊的舊項目，確保無縫接合
-          var newItems = chunkList
-              .map((e) => TranscriptItem.fromJson(e))
-              .where((item) => item.startTime > lastTime)
-              .toList();
-          note.transcript.addAll(newItems);
+          if (chunkList.isEmpty) {
+            emptyCount++;
+            if (emptyCount >= 2) break;
+          } else {
+            emptyCount = 0;
+            var newItems = chunkList
+                .map((e) => TranscriptItem.fromJson(e))
+                .where((item) => item.startTime > lastTime)
+                .toList();
+            note.transcript.addAll(newItems);
+          }
+        } catch (e) {
+          _log("分段 $i 補全失敗: $e");
+          // 容許單段失敗，系統會記錄錯誤但「繼續執行下一個 10 分鐘區塊」
         }
 
         if (i < maxChunks - 1) {
@@ -1765,7 +1792,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       builder: (context) => AlertDialog(
         title: const Text("重新分析選項"),
         content: const Text(
-            "您想如何重新分析？\n\n1. 【基於逐字稿】：保留您目前對逐字稿的修改，僅重新整理摘要與任務 (速度快)。\n\n2. 【語音重聽】：重新將錄音檔交給 AI 分析，會覆蓋現有所有資料。"),
+            "您想如何重新分析？\n\n1. 【基於逐字稿】：保留您目前對逐字稿的修改，僅重新整理摘要與任務 (速度快)。\n\n2. 【逐字稿補全】：再次將錄音檔交給 AI 分析，會補全現有短缺資料。\n\n3. 【語音重聽】：重新將錄音檔交給 AI 分析，會覆蓋現有所有資料。"),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context), child: const Text("取消")),
