@@ -1,7 +1,7 @@
 name: myapp
 description: "A new Flutter project."
 publish_to: 'none'
-version: 1.0.20+1
+version: 1.0.21+1
 
 environment:
   sdk: ^3.5.0
@@ -55,4 +55,7 @@ flutter_launcher_icons:
   android: "ic_launcher"
   ios: false                 # 若您後續需要打包 iOS 版本，請記得將此處改為 true
   image_path: "assets/app_icon.png" # 👈 修改這裡，指向您剛放入的圖片路徑
+  # --- 新增以下兩行：設定 Android 自適應圖示 ---
+  adaptive_icon_background: "#1E88E5" # 👈 請替換為您設計圖邊緣的主要底色 (Hex色碼)
+  adaptive_icon_foreground: "assets/app_icon.png"
   min_sdk_android: 21

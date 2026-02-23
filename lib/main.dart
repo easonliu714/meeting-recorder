@@ -646,19 +646,21 @@ class GlobalManager {
         totalDuration = td.toDouble();
       } else if (td is String) totalDuration = double.tryParse(td) ?? 600.0;
 
+      // --- 核心修正：移除對 AI 預估時間的依賴，改用連續空訊號判定結束 ---
       List<TranscriptItem> fullTranscript = [];
-      int chunkSizeMin = 10;
-      int totalChunks = (totalDuration / (chunkSizeMin * 60)).ceil();
-      if (totalChunks <= 0) totalChunks = 1;
+      int emptyCount = 0;
+      int maxChunks = 18; // 最高支援到 3 小時 (18 個 10分鐘分段)
 
-      for (int i = 0; i < totalChunks; i++) {
-        note.currentStep = "分析逐字稿 (${i + 1}/$totalChunks)...";
+      for (int i = 0; i < maxChunks; i++) {
+        note.currentStep = "分析逐字稿 (${i + 1}/未定)...";
         await saveNote(note);
         _log(note.currentStep);
 
-        // --- 核心修正：強化聽打準確度、說話者辨識與多語系動態翻譯規則 ---
+        double chunkStart = (i * 600).toDouble();
+        double chunkEnd = ((i + 1) * 600).toDouble();
+
         String transcriptPrompt = """
-        請扮演一位極度專業的「逐字稿聽打員」，針對 ${i * 10} 分鐘到 ${(i + 1) * 10} 分鐘的音訊提供一字不漏的逐字稿。
+        請扮演一位極度專業的「逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
         
         【最高指導原則】：
         1. 嚴禁憑空捏造！若該段時間無人說話、只有環境音，請直接回傳空陣列 []。
@@ -689,22 +691,30 @@ class GlobalManager {
           final chunkResponseText = await GeminiRestApi.generateContent(
               apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
           final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
-          fullTranscript.addAll(
-              chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
+
+          if (chunkList.isEmpty) {
+            emptyCount++;
+            if (emptyCount >= 2) {
+              _log("連續兩個分段未偵測到對話，判定音檔結束。");
+              break; // 連續兩段無聲，跳出迴圈
+            }
+          } else {
+            emptyCount = 0; // 有對話則重置計數器
+            fullTranscript.addAll(
+                chunkList.map((e) => TranscriptItem.fromJson(e)).toList());
+          }
         } catch (e) {
           _log("分段 $i 最終分析失敗: $e");
-          // 遇到非 429 的嚴重錯誤，或超過 5 次重試依然失敗，紀錄後繼續處理下一段，不讓整筆中斷
         }
 
-        // 基本的預防性延遲
-        if (i < totalChunks - 1) {
+        if (i < maxChunks - 1) {
           await Future.delayed(const Duration(seconds: 4));
         }
       }
 
       note.transcript = fullTranscript;
       note.status = NoteStatus.success;
-      note.currentStep = ''; // 清空狀態
+      note.currentStep = '';
       await saveNote(note);
       _log("分析完成！");
     } catch (e) {
@@ -716,6 +726,95 @@ class GlobalManager {
     }
   }
 
+// --- 新增：從目前中斷的地方繼續補全逐字稿 ---
+  static Future<void> completeMissingTranscript(MeetingNote note) async {
+    note.status = NoteStatus.processing;
+    note.currentStep = "準備上傳檔案以補全逐字稿...";
+    await saveNote(note);
+
+    final prefs = await SharedPreferences.getInstance();
+    final apiKey = prefs.getString('api_key') ?? '';
+    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
+    final List<String> vocabList = vocabListNotifier.value;
+    final List<String> participantList = participantListNotifier.value;
+
+    try {
+      if (apiKey.isEmpty) throw Exception("請先設定 API Key");
+
+      final audioFile = await getActualFile(note.audioPath);
+      final fileInfo = await GeminiRestApi.uploadFile(
+          apiKey, audioFile, 'audio/mp4', note.title);
+      final String fileUri = fileInfo['uri'];
+      final String fileName = fileInfo['name'].split('/').last;
+      await GeminiRestApi.waitForFileActive(apiKey, fileName);
+
+      // 取得目前逐字稿的最後時間
+      double lastTime =
+          note.transcript.isEmpty ? 0.0 : note.transcript.last.startTime;
+      int startChunk = (lastTime / 600).floor();
+      int emptyCount = 0;
+      int maxChunks = 18;
+
+      for (int i = startChunk; i < maxChunks; i++) {
+        note.currentStep = "補全逐字稿 (${i + 1}/未定)...";
+        await saveNote(note);
+        _log(note.currentStep);
+
+        double chunkStart = (i * 600).toDouble();
+        double chunkEnd = ((i + 1) * 600).toDouble();
+
+        // 告訴 AI 從哪裡開始聽，避免重複
+        String extraInstruction = i == startChunk
+            ? "特別注意：請直接從 $lastTime 秒開始聽打，忽略 $lastTime 秒之前的內容。"
+            : "";
+
+        String transcriptPrompt = """
+        請扮演一位極度專業的「逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
+        $extraInstruction
+        專有詞彙庫：${vocabList.join(', ')}
+        預設與會者名單：${participantList.join(', ')}
+        
+        【最高指導原則】：
+        1. 嚴禁憑空捏造！若無對話請回傳 []。
+        2. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
+        
+        回傳純 JSON 陣列格式範例：
+        [{"speaker":"A", "text":"你好", "startTime": 12.5}]
+        """;
+
+        final chunkResponseText = await GeminiRestApi.generateContent(
+            apiKey, modelName, transcriptPrompt, fileUri, 'audio/mp4');
+        final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
+
+        if (chunkList.isEmpty) {
+          emptyCount++;
+          if (emptyCount >= 2) break;
+        } else {
+          emptyCount = 0;
+          // 過濾掉時間重疊的舊項目，確保無縫接合
+          var newItems = chunkList
+              .map((e) => TranscriptItem.fromJson(e))
+              .where((item) => item.startTime > lastTime)
+              .toList();
+          note.transcript.addAll(newItems);
+        }
+
+        if (i < maxChunks - 1) {
+          await Future.delayed(const Duration(seconds: 4));
+        }
+      }
+
+      // 補全完畢後，直接呼叫重新摘要功能
+      await reSummarizeFromTranscript(note);
+    } catch (e) {
+      _log("補全失敗: $e");
+      note.status = NoteStatus.failed;
+      note.summary.insert(0, "補全失敗: $e");
+      note.currentStep = '';
+      await saveNote(note);
+    }
+  }
+
   static Future<void> reSummarizeFromTranscript(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.currentStep = "基於最新逐字稿整理摘要...";
@@ -723,8 +822,7 @@ class GlobalManager {
 
     final prefs = await SharedPreferences.getInstance();
     final apiKey = prefs.getString('api_key') ?? '';
-    final modelName =
-        prefs.getString('model_name') ?? 'gemini-1.5-flash-latest';
+    final modelName = prefs.getString('model_name') ?? 'gemini-flash-latest';
 
     try {
       if (apiKey.isEmpty) throw Exception("請先設定 API Key");
@@ -1102,8 +1200,8 @@ class _MainAppShellState extends State<MainAppShell> {
             audioFile = File('${dir.path}/${video.id}.mp4');
             var fileStream = audioFile.openWrite();
 
-            // 拉長至 60 秒，應付較大檔案與降速限制
-            await stream.pipe(fileStream).timeout(const Duration(seconds: 60));
+            // --- 縮短為 15 秒，避免無限掛起 ---
+            await stream.pipe(fileStream).timeout(const Duration(seconds: 15));
             await fileStream.flush();
             await fileStream.close();
             break;
@@ -1123,10 +1221,10 @@ class _MainAppShellState extends State<MainAppShell> {
               audioFile = File('${dir.path}/${video.id}.mp4');
               var fileStream = audioFile.openWrite();
 
-              // 影音檔較大，給予 90 秒
+              // 影音檔較大，給予 20 秒
               await stream
                   .pipe(fileStream)
-                  .timeout(const Duration(seconds: 90));
+                  .timeout(const Duration(seconds: 20));
               await fileStream.flush();
               await fileStream.close();
               break;
@@ -1150,9 +1248,12 @@ class _MainAppShellState extends State<MainAppShell> {
       } catch (e) {
         String errorMsg = e.toString();
         // 偵測是否為 YouTube 的節點封鎖 (如您日誌中的 SocketException)
-        if (errorMsg.contains("SocketException") ||
+        // --- 修正：更明確的阻擋提示 ---
+        if (errorMsg.contains("TimeoutException") ||
+            errorMsg.contains("SocketException") ||
             errorMsg.contains("host lookup")) {
-          errorMsg = "YouTube 伺服器節點阻擋 (防抓取機制)。建議先使用外部工具下載為 MP3 後再匯入。";
+          errorMsg =
+              "YouTube 伺服器已阻擋此連線 (防爬蟲機制)。\n💡 建議：請透過瀏覽器使用外部工具 (如 yt1s.com) 下載為音檔後，改用【匯入本地音檔】功能上傳。";
         }
 
         GlobalManager.addLog("YT處理最終失敗: $errorMsg");
@@ -1681,6 +1782,21 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             },
             child: const Text("基於逐字稿"),
           ),
+          // --- 新增：補全逐字稿選項 ---
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                _note.status = NoteStatus.processing;
+                _note.summary = ["AI 補全逐字稿中..."];
+              });
+              GlobalManager.completeMissingTranscript(_note).then((_) {
+                if (mounted) _reloadNote();
+              });
+            },
+            child: const Text("補全缺漏段落", style: TextStyle(color: Colors.green)),
+          ),
+          // ---------------------------
           TextButton(
             onPressed: () {
               Navigator.pop(context);
