@@ -647,6 +647,7 @@ class GlobalManager {
       1. 你的分析必須 100% 基於音訊內容。如果音訊是無聲、純雜音或無實質對話，你必須承認沒有內容。
       2. 若無實質內容，title 請寫「未偵測到有效對話」，summary 寫「無」，tasks 與 sections 給空陣列 []。
       3. 任務期限若無明確提及具體日期，必須填寫「未定」，嚴禁自己發明日期。
+      4. 【重要：段落時間軸嚴格規範】：sections 陣列中的 startTime 與 endTime 必須是換算後的「絕對秒數」（純數字，例如 18 分鐘請換算並填寫 1080）。絕對不可以使用 MM:SS 格式，也不可以單純寫分鐘數，以免系統解析崩潰。
       
       請直接回傳純 JSON 格式，包含:
       - title (字串)
@@ -799,6 +800,16 @@ class GlobalManager {
       final String fileName = fileInfo['name'].split('/').last;
       await GeminiRestApi.waitForFileActive(apiKey, fileName);
 
+      // 💡【新增】：取得最後幾句話作為上下文錨點，強迫 AI 尋找斷點
+      String lastContext = "";
+      if (note.transcript.isNotEmpty) {
+        int takeCount = note.transcript.length > 4 ? 4 : note.transcript.length;
+        lastContext = note.transcript
+            .sublist(note.transcript.length - takeCount)
+            .map((e) => "${e.speaker}: ${e.text}")
+            .join('\n');
+      }
+
       int emptyCount = 0;
 
       for (int i = startChunk; i < maxChunks; i++) {
@@ -810,9 +821,10 @@ class GlobalManager {
         double chunkStart = (i * 600).toDouble();
         double chunkEnd = ((i + 1) * 600).toDouble();
 
-        String extraInstruction = i == startChunk
-            ? "特別注意：請直接從 $lastTime 秒開始聽打，忽略 $lastTime 秒之前的內容。"
-            : "";
+        // 💡【修正】：利用上下文錨點強迫 AI 無縫接合
+        String extraInstruction = i == startChunk && lastContext.isNotEmpty
+            ? "【上下文無縫接合指示】：前一段的最後幾句對話是：\n---\n$lastContext\n---\n請你仔細在音檔中找到這段話的位置，並「嚴格從這句話結束的地方」開始繼續聽打！絕對不要從頭開始，也不要重複輸出這幾句話。"
+            : "特別注意：請忽略 $chunkStart 秒之前的內容，直接從 $chunkStart 秒開始聽打。";
 
         String transcriptPrompt = """
         請扮演一位極度專業的「逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
@@ -822,7 +834,8 @@ class GlobalManager {
         
         【最高指導原則】：
         1. 嚴禁憑空捏造！若無對話請回傳 []。
-        2. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
+        2. 所有的 startTime 必須是基於音檔開頭的「絕對秒數」（例如必須大於 $lastTime）。
+        3. 多語系翻譯規則：若整句話是非中文，請提供[原文]、[拼音]、[翻譯]三行格式。
         
         回傳純 JSON 陣列格式範例：
         [{"speaker":"A", "text":"你好", "startTime": 12.5}]
@@ -895,6 +908,8 @@ class GlobalManager {
       【最高限制原則：絕對禁止憑空捏造！】
       1. 內容必須 100% 來自上方文字，不可自行腦補。
       2. 任務期限若無明確提及具體日期，必須填寫「未定」。
+      3. 【重要：段落時間軸嚴格規範】：sections 陣列中的 startTime 與 endTime，必須完全對照上方逐字稿中括號內的 [秒數] 來填寫。必須填寫「純數字的秒數」（例如 1080 代表 1080秒）。絕對不可填寫分鐘數或 MM:SS 格式！
+      
       請回傳純 JSON 格式，包含:
       - title (字串)
       - summary (字串陣列)
