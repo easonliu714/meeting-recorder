@@ -19,6 +19,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+const String APP_VERSION = "1.0.31"; // 💡 版本號定義
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await GlobalManager.init();
@@ -248,7 +250,7 @@ class GeminiRestApi {
   ) async {
     int fileSize = await file.length();
     _log(
-        '準備上傳 (使用 Key ${_maskKey(apiKey)}): $displayName (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)');
+        '準備上傳音檔 (使用 Key ${_maskKey(apiKey)}): $displayName (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)');
 
     final initUrl = Uri.parse(
         '$_baseUrl/upload/v1beta/files?key=$apiKey&uploadType=resumable');
@@ -313,7 +315,7 @@ class GeminiRestApi {
     throw Exception('Timeout waiting for file to become ACTIVE');
   }
 
-  // 這是給純語音 (原生Gemini) 使用的，需要綁定單一 Key
+  // 💡 給原生音訊用的產生函數 (若耗盡，則直接拋出 Exception 讓外層知道要換 Key 上傳)
   static Future<String> generateContent(
     String lockedApiKey,
     List<String> modelsToTry,
@@ -326,7 +328,7 @@ class GeminiRestApi {
           '$_baseUrl/v1beta/models/$currentModel:generateContent?key=$lockedApiKey');
 
       int retryCount = 0;
-      int maxRetries = 5;
+      int maxRetries = 4;
 
       while (retryCount < maxRetries) {
         if (retryCount == 0) _log('發送請求至模型: $currentModel');
@@ -356,11 +358,13 @@ class GeminiRestApi {
               .timeout(const Duration(seconds: 120));
 
           if (response.statusCode == 429) {
-            double waitSeconds = 20.0;
-            if (response.body.contains('RESOURCE_EXHAUSTED'))
-              waitSeconds = 60.0;
-            _log("⚠️ 額度耗盡 (429)，啟動智慧休眠等待 ${waitSeconds.toInt()} 秒...");
-            await Future.delayed(Duration(seconds: waitSeconds.toInt()));
+            // 💡 遇到額度耗盡，直接拋出，讓 GlobalManager 接手換 Key 並重新上傳
+            if (response.body.contains('RESOURCE_EXHAUSTED')) {
+              throw Exception("RESOURCE_EXHAUSTED");
+            }
+            // 一般請求過快，稍作休眠
+            _log("⚠️ 請求過於頻繁 (429)，等待 15 秒...");
+            await Future.delayed(const Duration(seconds: 15));
             retryCount++;
             continue;
           }
@@ -376,6 +380,9 @@ class GeminiRestApi {
           return jsonDecode(response.body)['candidates'][0]['content']['parts']
               [0]['text'];
         } catch (e) {
+          if (e.toString().contains("RESOURCE_EXHAUSTED")) {
+            rethrow; // 繼續往外拋出，啟動換 Key 上傳機制
+          }
           if (retryCount < maxRetries - 1 &&
               !e.toString().contains('Generate failed')) {
             await Future.delayed(const Duration(seconds: 10));
@@ -387,10 +394,10 @@ class GeminiRestApi {
         }
       }
     }
-    throw Exception('已嘗試所有策略模型皆失敗，可能額度已徹底耗盡，請稍後再試。');
+    throw Exception('所有模型測試失敗');
   }
 
-  // 💡 核心更新：無縫接力的純文字 API 請求 (接受完整 API Keys 陣列)
+  // 無縫接力的純文字 API 請求 (接受完整 API Keys 陣列)
   static Future<String> generateTextOnly(
       List<String> apiKeys, List<String> modelsToTry, String prompt,
       {Function(String)? onWait}) async {
@@ -401,7 +408,7 @@ class GeminiRestApi {
             '$_baseUrl/v1beta/models/$currentModel:generateContent?key=$currentKey');
 
         int retryCount = 0;
-        int maxRetries = 3; // 每個 Key 容忍 3 次網路波動
+        int maxRetries = 3;
 
         while (retryCount < maxRetries) {
           try {
@@ -429,7 +436,6 @@ class GeminiRestApi {
                     "⚠️ Key ${_maskKey(currentKey)} 在 $currentModel 額度已滿，無縫切換下一把 Key...");
                 break; // 💡 打破 while 迴圈，讓外層 for 迴圈直接進入下一把 Key (k++)
               } else {
-                // 若只是單純送太快 (Rate limit)
                 if (onWait != null) onWait("請求過快，短暫休眠 15 秒...");
                 await Future.delayed(const Duration(seconds: 15));
                 retryCount++;
@@ -437,8 +443,7 @@ class GeminiRestApi {
               }
             }
 
-            if (response.statusCode == 404 || response.statusCode == 400)
-              break; // 模型不存在，跳出換下一個模型
+            if (response.statusCode == 404 || response.statusCode == 400) break;
 
             if (response.statusCode != 200) {
               throw Exception('Generate failed: ${response.body}');
@@ -453,7 +458,7 @@ class GeminiRestApi {
               retryCount++;
               continue;
             } else {
-              break; // 換下一把 Key
+              break;
             }
           }
         }
@@ -545,6 +550,9 @@ class GlobalManager {
     participantListNotifier.value =
         prefs.getStringList('participant_list') ?? [];
     logsNotifier.value = prefs.getStringList('app_logs') ?? [];
+
+    _log("APP 啟動 (版本: $APP_VERSION)"); // 💡 顯示版本號
+
     await loadNotes();
   }
 
@@ -674,7 +682,7 @@ class GlobalManager {
     try {
       if (apiKeys.isEmpty) throw Exception("請先設定 Gemini API Key");
 
-      // 💡 限定嚴格模型組合
+      // 嚴格模型組合
       List<String> modelsToTry = strategy == 'pro'
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
@@ -682,119 +690,136 @@ class GlobalManager {
       final audioFile = await getActualFile(note.audioPath);
       if (!await audioFile.exists()) throw Exception("找不到音訊檔案");
 
-      // 智能體積判定 (25MB 限制)
+      // 💡 智能體積判定 (25MB 限制)
       final int fileSize = await audioFile.length();
       final double fileSizeMB = fileSize / (1024 * 1024);
       final bool isOversized = fileSizeMB >= 25.0;
 
-      if (strategy == 'groq_gemini' && isOversized) {
-        _log("⚠️ 檔案大小 (${fileSizeMB.toStringAsFixed(1)}MB) 超過 Groq 25MB 限制！");
-        _log("⚡ 系統自動觸發分流，將使用 Gemini 原生引擎分析大型檔案...");
-        strategy = 'flash'; // 強制切換回 Flash 策略
-        modelsToTry = ['gemini-flash-latest', 'gemini-2.5-flash'];
-      }
-
-      final tempPlayer = AudioPlayer();
-      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
-      final duration = await tempPlayer.getDuration();
-      await tempPlayer.dispose();
-      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      bool useGeminiFallback = false;
 
       if (strategy == 'groq_gemini') {
+        if (isOversized) {
+          _log(
+              "⚠️ 檔案大小 (${fileSizeMB.toStringAsFixed(1)}MB) 超過 Groq 建議限制。系統將先嘗試上傳，若失敗將無縫降級至原生引擎。");
+        }
         if (groqKey.isEmpty) throw Exception("選擇了高精度雙引擎，但未設定 Groq API Key");
 
         note.currentStep = "Groq STT 引擎分析中...";
         await saveNote(note);
 
-        List<dynamic> whisperSegments =
-            await GroqApi.transcribeAudio(groqKey, audioFile);
-
-        if (whisperSegments.isEmpty) {
-          throw Exception("音檔無內容或辨識失敗");
-        }
-
-        List<TranscriptItem> fullTranscript = [];
-        StringBuffer currentChunk = StringBuffer();
-
-        int totalSegments = whisperSegments.length;
-        int batchSize = 40; // 每 40 句話送一次
-        int totalBatches = (totalSegments / batchSize).ceil();
-        int chunkCount = 0;
-
-        note.currentStep = "Gemini 講者辨識 (0/$totalBatches)...";
-        await saveNote(note);
-
-        for (var i = 0; i < totalSegments; i++) {
-          var seg = whisperSegments[i];
-          currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
-
-          if ((i + 1) % batchSize == 0 || i == totalSegments - 1) {
-            chunkCount++;
-
-            note.currentStep = "Gemini 講者辨識 ($chunkCount/$totalBatches)...";
-            await saveNote(note);
-
-            String textPrompt = """
-            以下是外部 STT 引擎產生的純文字逐字稿（帶有精準時間戳）：
-            ---
-            $currentChunk
-            ---
-            請扮演會議記錄員，執行以下任務：
-            1. 根據對話上下文，判斷說話者是誰 (Speaker A, Speaker B 等)。
-            2. 若整句話是外文，請翻譯成繁體中文。
-            3. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
-            
-            回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
-            """;
-
-            try {
-              // 💡 無縫接力：傳入完整的 apiKeys 陣列，讓系統自動輪替
-              final chunkResponse = await GeminiRestApi.generateTextOnly(
-                  apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
-                note.currentStep = "講者辨識 ($chunkCount/$totalBatches) - $msg";
-                await saveNote(note);
-              });
-
-              final List<dynamic> parsedList = _parseJsonList(chunkResponse);
-              fullTranscript.addAll(
-                  parsedList.map((e) => TranscriptItem.fromJson(e)).toList());
-
-              currentChunk.clear();
-              _log("已完成第 $chunkCount/$totalBatches 批次講者辨識。");
-            } catch (e) {
-              _log("⚠️ 第 $chunkCount 批次講者辨識失敗跳過: $e");
-              currentChunk.clear();
-              continue;
-            }
+        List<dynamic> whisperSegments = [];
+        try {
+          whisperSegments = await GroqApi.transcribeAudio(groqKey, audioFile);
+        } catch (e) {
+          // 💡 攔截 413 錯誤，啟動降級
+          if (e.toString().contains('413') ||
+              e.toString().contains('Too Large') ||
+              isOversized) {
+            _log("❌ Groq 拒絕處理大型檔案。準備無縫切換至 Gemini 原生引擎...");
+            useGeminiFallback = true;
+          } else {
+            rethrow; // 其他網路異常直接中斷
           }
         }
 
-        note.transcript = fullTranscript;
+        if (!useGeminiFallback) {
+          if (whisperSegments.isEmpty) throw Exception("音檔無內容或辨識失敗");
 
-        note.currentStep = "最終摘要生成中...";
-        await saveNote(note);
-        await reSummarizeFromTranscript(note);
-        return;
-      } else {
-        // --- Gemini 原生語音處理模式 (處理 >25MB) ---
-        // 原生語音因為綁定 File URI，仍須鎖定第一把 Key (隨機選取分攤流量)
-        apiKeys.shuffle(Random());
-        final String lockedKey = apiKeys.first;
+          List<TranscriptItem> fullTranscript = [];
+          StringBuffer currentChunk = StringBuffer();
+
+          int totalSegments = whisperSegments.length;
+          int batchSize = 40;
+          int totalBatches = (totalSegments / batchSize).ceil();
+          int chunkCount = 0;
+
+          note.currentStep = "Gemini 講者辨識 (0/$totalBatches)...";
+          await saveNote(note);
+
+          for (var i = 0; i < totalSegments; i++) {
+            var seg = whisperSegments[i];
+            currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
+
+            if ((i + 1) % batchSize == 0 || i == totalSegments - 1) {
+              chunkCount++;
+
+              note.currentStep = "Gemini 講者辨識 ($chunkCount/$totalBatches)...";
+              await saveNote(note);
+
+              String textPrompt = """
+              以下是外部 STT 引擎產生的純文字逐字稿（帶有精準時間戳）：
+              ---
+              $currentChunk
+              ---
+              請扮演會議記錄員，執行以下任務：
+              1. 參考最新的專有詞彙庫：${vocabList.join(', ')}。
+              2. 參考最新與會者名單：${participantList.join(', ')}。根據對話上下文，判斷說話者是誰。
+              3. 若整句話是外文，請翻譯成繁體中文。
+              4. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
+              
+              回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
+              """;
+
+              try {
+                // 無縫接力處理文字
+                final chunkResponse = await GeminiRestApi.generateTextOnly(
+                    apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
+                  note.currentStep = "講者辨識 ($chunkCount/$totalBatches) - $msg";
+                  await saveNote(note);
+                });
+
+                final List<dynamic> parsedList = _parseJsonList(chunkResponse);
+                fullTranscript.addAll(
+                    parsedList.map((e) => TranscriptItem.fromJson(e)).toList());
+
+                currentChunk.clear();
+                _log("已完成第 $chunkCount/$totalBatches 批次講者辨識。");
+              } catch (e) {
+                _log("⚠️ 第 $chunkCount 批次講者辨識失敗跳過: $e");
+                currentChunk.clear();
+                continue;
+              }
+            }
+          }
+
+          note.transcript = fullTranscript;
+
+          note.currentStep = "最終摘要生成中...";
+          await saveNote(note);
+          await reSummarizeFromTranscript(note);
+          return;
+        }
+      }
+
+      // --- 💡 Gemini 原生語音處理模式 (解決換 Key 卡死問題) ---
+      if (strategy != 'groq_gemini' || useGeminiFallback) {
+        modelsToTry = strategy == 'pro'
+            ? ['gemini-pro-latest', 'gemini-2.5-pro']
+            : ['gemini-flash-latest', 'gemini-2.5-flash'];
+
+        int currentKeyIndex = 0;
+        String lockedKey = apiKeys[currentKeyIndex];
 
         int chunkSize = strategy == 'pro' ? 120 : 300;
 
+        final tempPlayer = AudioPlayer();
+        await tempPlayer.setSource(DeviceFileSource(audioFile.path));
+        final duration = await tempPlayer.getDuration();
+        await tempPlayer.dispose();
+        double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
         if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
+
         int maxChunks = (totalSeconds / chunkSize).ceil();
         if (maxChunks == 0) maxChunks = 1;
 
         note.currentStep = "上傳大型音訊檔案中...";
         await saveNote(note);
 
-        final fileInfo = await GeminiRestApi.uploadFile(
+        var fileInfo = await GeminiRestApi.uploadFile(
             lockedKey, audioFile, 'audio/mp4', note.title);
-        final String fileUri = fileInfo['uri'];
-        final String fileName = fileInfo['name'].split('/').last;
-        await GeminiRestApi.waitForFileActive(lockedKey, fileName);
+        String fileUri = fileInfo['uri'];
+        await GeminiRestApi.waitForFileActive(
+            lockedKey, fileInfo['name'].split('/').last);
 
         note.currentStep = "AI 正在分析會議摘要...";
         await saveNote(note);
@@ -805,23 +830,27 @@ class GlobalManager {
         sections 的 startTime 與 endTime 必須是「絕對秒數」（純數字）。
         """;
 
-        final overviewResponseText = await GeminiRestApi.generateContent(
-            lockedKey, modelsToTry, overviewPrompt, fileUri, 'audio/mp4');
-        final overviewJson = _parseJson(overviewResponseText);
-
-        note.title = overviewJson['title']?.toString() ?? note.title;
-        var rawSummary = overviewJson['summary'];
-        note.summary = rawSummary is List
-            ? rawSummary.map((e) => e.toString()).toList()
-            : ["摘要生成失敗"];
-        note.tasks = (overviewJson['tasks'] as List<dynamic>?)
-                ?.map((e) => TaskItem.fromJson(e))
-                .toList() ??
-            [];
-        note.sections = (overviewJson['sections'] as List<dynamic>?)
-                ?.map((e) => Section.fromJson(e))
-                .toList() ??
-            [];
+        // 摘要如果失敗，也加入換 Key 邏輯
+        try {
+          final overviewResponseText = await GeminiRestApi.generateContent(
+              lockedKey, modelsToTry, overviewPrompt, fileUri, 'audio/mp4');
+          final overviewJson = _parseJson(overviewResponseText);
+          note.title = overviewJson['title']?.toString() ?? note.title;
+          var rawSummary = overviewJson['summary'];
+          note.summary = rawSummary is List
+              ? rawSummary.map((e) => e.toString()).toList()
+              : ["摘要生成失敗"];
+          note.tasks = (overviewJson['tasks'] as List<dynamic>?)
+                  ?.map((e) => TaskItem.fromJson(e))
+                  .toList() ??
+              [];
+          note.sections = (overviewJson['sections'] as List<dynamic>?)
+                  ?.map((e) => Section.fromJson(e))
+                  .toList() ??
+              [];
+        } catch (e) {
+          _log("摘要產生遇到問題: $e，將繼續嘗試逐字稿聽打。");
+        }
 
         List<TranscriptItem> fullTranscript = [];
         int emptyCount = 0;
@@ -841,24 +870,53 @@ class GlobalManager {
           請回傳純 JSON 陣列。
           """;
 
-          try {
-            final chunkResponseText = await GeminiRestApi.generateContent(
-                lockedKey, modelsToTry, transcriptPrompt, fileUri, 'audio/mp4');
-            final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
+          bool chunkSuccess = false;
+          while (!chunkSuccess) {
+            try {
+              final chunkResponseText = await GeminiRestApi.generateContent(
+                  lockedKey,
+                  modelsToTry,
+                  transcriptPrompt,
+                  fileUri,
+                  'audio/mp4');
+              final List<dynamic> chunkList = _parseJsonList(chunkResponseText);
 
-            if (chunkList.isEmpty) {
-              emptyCount++;
-              if (emptyCount >= 2) break;
-            } else {
-              emptyCount = 0;
-              var newItems =
-                  chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
-              newItems.removeWhere((item) => item.startTime > totalSeconds);
-              fullTranscript.addAll(newItems);
+              if (chunkList.isEmpty) {
+                emptyCount++;
+                if (emptyCount >= 2) break; // 真的一直空白，跳出迴圈
+              } else {
+                emptyCount = 0;
+                var newItems =
+                    chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
+                newItems.removeWhere((item) => item.startTime > totalSeconds);
+                fullTranscript.addAll(newItems);
+              }
+              chunkSuccess = true;
+            } catch (e) {
+              if (e.toString().contains("RESOURCE_EXHAUSTED")) {
+                currentKeyIndex++;
+                if (currentKeyIndex >= apiKeys.length)
+                  throw Exception("所有 API Key 均已耗盡！");
+
+                lockedKey = apiKeys[currentKeyIndex];
+                _log("🔄 額度滿載！無縫切換 Key ${_maskKey(lockedKey)}，正在重新上傳音檔...");
+
+                note.currentStep = "額度切換，重傳音檔中...";
+                await saveNote(note);
+
+                fileInfo = await GeminiRestApi.uploadFile(
+                    lockedKey, audioFile, 'audio/mp4', note.title);
+                fileUri = fileInfo['uri'];
+                await GeminiRestApi.waitForFileActive(
+                    lockedKey, fileInfo['name'].split('/').last);
+
+                note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
+                await saveNote(note);
+              } else {
+                _log("分段 $i 最終分析失敗: $e");
+                chunkSuccess = true; // 網路錯誤，略過此段繼續下一段
+              }
             }
-          } catch (e) {
-            _log("分段 $i 最終分析失敗: $e");
-            break;
           }
         }
 
@@ -877,9 +935,91 @@ class GlobalManager {
     }
   }
 
-  static Future<void> completeMissingTranscript(MeetingNote note) async {
-    _log("雙引擎模式已啟動，補全功能自動轉向重新整理摘要");
-    await reSummarizeFromTranscript(note);
+  // 三段式重整方案二【重新校正錯字與講者】
+  static Future<void> reCalibrateTranscript(MeetingNote note) async {
+    note.status = NoteStatus.processing;
+    note.currentStep = "準備校正逐字稿...";
+    await saveNote(note);
+
+    final prefs = await SharedPreferences.getInstance();
+    final List<String> apiKeys = await getApiKeys();
+    final String strategy =
+        prefs.getString('analysis_strategy') ?? 'groq_gemini';
+    final List<String> vocabList = vocabListNotifier.value;
+    final List<String> participantList = participantListNotifier.value;
+
+    try {
+      if (apiKeys.isEmpty) throw Exception("請先設定 API Key");
+      if (note.transcript.isEmpty) throw Exception("沒有可用的逐字稿，請選擇「徹底語音重聽」。");
+
+      List<String> modelsToTry = strategy == 'pro'
+          ? ['gemini-pro-latest', 'gemini-2.5-pro']
+          : ['gemini-flash-latest', 'gemini-2.5-flash'];
+
+      List<TranscriptItem> calibratedTranscript = [];
+
+      int totalItems = note.transcript.length;
+      int batchSize = 40;
+      int totalBatches = (totalItems / batchSize).ceil();
+
+      for (int i = 0; i < totalBatches; i++) {
+        int startIdx = i * batchSize;
+        int endIdx = min((i + 1) * batchSize, totalItems);
+        var batchItems = note.transcript.sublist(startIdx, endIdx);
+
+        note.currentStep = "AI 正在校正錯字與講者 (${i + 1}/$totalBatches)...";
+        await saveNote(note);
+
+        StringBuffer currentChunk = StringBuffer();
+        for (var item in batchItems) {
+          currentChunk.writeln(
+              "[${item.startTime}秒] ${item.speaker}: ${item.original}");
+        }
+
+        String textPrompt = """
+        以下是現有的逐字稿（帶有精準時間戳）：
+        ---
+        $currentChunk
+        ---
+        請扮演專業會議記錄員，執行以下「校正」任務：
+        1. 參考最新的專有詞彙庫：${vocabList.join(', ')}。請修正文字中的同音錯字或不通順的專有名詞。
+        2. 參考最新的與會者名單：${participantList.join(', ')}。根據對話上下文，重新精準判斷說話者是誰。
+        3. 若整句話是外文或夾雜外文，請在 translation 欄位提供繁體中文翻譯。
+        4. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
+        
+        請回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
+        """;
+
+        try {
+          final chunkResponse = await GeminiRestApi.generateTextOnly(
+              apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
+            note.currentStep = "校正進度 (${i + 1}/$totalBatches) - $msg";
+            await saveNote(note);
+          });
+
+          final List<dynamic> parsedList = _parseJsonList(chunkResponse);
+          calibratedTranscript.addAll(
+              parsedList.map((e) => TranscriptItem.fromJson(e)).toList());
+          _log("已完成第 ${i + 1}/$totalBatches 批次文字校正。");
+        } catch (e) {
+          _log("⚠️ 第 ${i + 1} 批次校正失敗，已為您保留該段的原始內容: $e");
+          calibratedTranscript.addAll(batchItems);
+        }
+      }
+
+      note.transcript = calibratedTranscript;
+      await saveNote(note);
+
+      note.currentStep = "文字校正完畢，正在重整最終摘要...";
+      await saveNote(note);
+      await reSummarizeFromTranscript(note);
+    } catch (e) {
+      _log("校正流程發生嚴重錯誤: $e");
+      note.status = NoteStatus.failed;
+      note.summary.insert(0, "校正失敗: $e");
+      note.currentStep = '';
+      await saveNote(note);
+    }
   }
 
   static Future<void> reSummarizeFromTranscript(MeetingNote note) async {
@@ -894,7 +1034,6 @@ class GlobalManager {
     try {
       if (apiKeys.isEmpty) throw Exception("請先設定 API Key");
 
-      // 💡 嚴格模型組合
       List<String> modelsToTry = strategy == 'pro'
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
@@ -927,7 +1066,6 @@ class GlobalManager {
       請回傳包含 title, summary, tasks, sections 的純 JSON 格式。
       """;
 
-      // 💡 無縫接力處理摘要
       final responseText =
           await GeminiRestApi.generateTextOnly(apiKeys, modelsToTry, prompt);
       final overviewJson = _parseJson(responseText);
@@ -1056,7 +1194,7 @@ class _MainAppShellState extends State<MainAppShell> {
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
       final path = '${dir.path}/$fileName';
 
-      // 💡 關鍵優化：32kbps 位元率，1小時錄音僅 14MB，完美符合 Groq 限制
+      // 💡 內建錄音強制使用 32kbps 瘦身，確保符合 25MB 大小限制
       await audioRecorder.start(
         const RecordConfig(
           encoder: AudioEncoder.aacLc,
@@ -1152,6 +1290,7 @@ class _MainAppShellState extends State<MainAppShell> {
     if (mounted) setState(() {});
   }
 
+  // 💡 匯入音檔：檔名日期第一優先解析
   Future<void> pickFile() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.storage,
@@ -1178,22 +1317,21 @@ class _MainAppShellState extends State<MainAppShell> {
 
         DateTime fileDate = DateTime.now();
         try {
-          fileDate = await file.lastModified();
+          String fileName = result.files.single.name;
+          RegExp regExp = RegExp(
+              r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})');
+          var match = regExp.firstMatch(fileName);
 
-          if (DateTime.now().difference(fileDate).inMinutes < 5) {
-            String fileName = result.files.single.name;
-            RegExp regExp = RegExp(
-                r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})');
-            var match = regExp.firstMatch(fileName);
-            if (match != null) {
-              int y = int.parse(match.group(1)!);
-              int m = int.parse(match.group(2)!);
-              int d = int.parse(match.group(3)!);
-              int h = int.parse(match.group(4)!);
-              int min = int.parse(match.group(5)!);
-              fileDate = DateTime(y, m, d, h, min);
-              GlobalManager.addLog("從檔名成功解析真實錄音時間: $fileDate");
-            }
+          if (match != null) {
+            int y = int.parse(match.group(1)!);
+            int m = int.parse(match.group(2)!);
+            int d = int.parse(match.group(3)!);
+            int h = int.parse(match.group(4)!);
+            int min = int.parse(match.group(5)!);
+            fileDate = DateTime(y, m, d, h, min);
+            GlobalManager.addLog("從檔名成功解析真實錄音時間: $fileDate");
+          } else {
+            fileDate = await file.lastModified();
           }
         } catch (e) {
           GlobalManager.addLog("取得檔案時間失敗: $e");
@@ -1808,8 +1946,10 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       context: context,
       builder: (context) => AlertDialog(
         title: const Text("重新分析選項"),
-        content: const Text(
-            "您想如何重新分析？\n\n1. 【基於逐字稿】：保留修改，僅重新整理摘要與任務。\n\n2. 【語音重聽】：徹底覆蓋現有資料。"),
+        content: const Text("請選擇您需要的重整層級：\n\n"
+            "1. 【僅重整摘要與任務】：保留現有逐字稿，僅重新生成摘要。\n\n"
+            "2. 【重新校正錯字與講者】：套用最新字典與名單，校正現有逐字稿並重整摘要 (極度省時省額度)。\n\n"
+            "3. 【徹底語音重聽】：重新辨識音檔，覆蓋所有資料。"),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context), child: const Text("取消")),
@@ -1818,26 +1958,39 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               Navigator.pop(context);
               setState(() {
                 _note.status = NoteStatus.processing;
-                _note.summary = ["AI 分析中 (基於逐字稿)..."];
+                _note.summary = ["AI 分析中 (僅重整摘要)..."];
               });
               GlobalManager.reSummarizeFromTranscript(_note).then((_) {
                 if (mounted) _reloadNote();
               });
             },
-            child: const Text("基於逐字稿"),
+            child: const Text("僅重整摘要"),
           ),
           TextButton(
             onPressed: () {
               Navigator.pop(context);
               setState(() {
                 _note.status = NoteStatus.processing;
-                _note.summary = ["AI 語音重聽分析中..."];
+                _note.summary = ["AI 正在校正錯字與講者..."];
+              });
+              GlobalManager.reCalibrateTranscript(_note).then((_) {
+                if (mounted) _reloadNote();
+              });
+            },
+            child: const Text("校正錯字與講者", style: TextStyle(color: Colors.green)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                _note.status = NoteStatus.processing;
+                _note.summary = ["AI 徹底語音重聽分析中..."];
               });
               GlobalManager.analyzeNote(_note).then((_) {
                 if (mounted) _reloadNote();
               });
             },
-            child: const Text("語音重聽", style: TextStyle(color: Colors.red)),
+            child: const Text("徹底語音重聽", style: TextStyle(color: Colors.red)),
           ),
         ],
       ),
@@ -2192,6 +2345,23 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         bytes: await pdf.save(), filename: 'meeting_note.pdf');
   }
 
+  // 💡 新增：匯出原始音檔功能
+  Future<void> _exportAudio() async {
+    try {
+      File f = await GlobalManager.getActualFile(_note.audioPath);
+      if (await f.exists()) {
+        await Share.shareXFiles([XFile(f.path)],
+            text: '匯出會議音檔: ${_note.title}');
+      } else {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text("找不到實體音檔，可能已被系統清除")));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("音檔匯出失敗: $e")));
+    }
+  }
+
   Future<void> _confirmDelete() async {
     bool? confirm = await showDialog<bool>(
       context: context,
@@ -2240,12 +2410,17 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
+              if (value == 'audio') _exportAudio(); // 💡 綁定選單
               if (value == 'delete') _confirmDelete();
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'pdf', child: Text("匯出 PDF")),
               const PopupMenuItem(value: 'csv', child: Text("匯出 Excel (CSV)")),
               const PopupMenuItem(value: 'md', child: Text("匯出 Markdown")),
+              const PopupMenuItem(
+                  value: 'audio',
+                  child: Text("匯出原始音檔 (轉檔用)",
+                      style: TextStyle(color: Colors.blue))),
               const PopupMenuItem(
                   value: 'delete',
                   child: Text("刪除紀錄", style: TextStyle(color: Colors.red))),
