@@ -1,7 +1,7 @@
 name: myapp
 description: "A new Flutter project."
 publish_to: 'none'
-version: 1.0.38+1
+version: 1.0.39+1
 
 environment:
   sdk: ^3.5.0
@@ -22,6 +22,7 @@ dependencies:
   audioplayers: ^6.0.0
   wakelock_plus: ^1.1.4  # 新增這個，用來防止錄音時螢幕休眠
   flutter_foreground_task: ^6.4.0  # 💡 新增：用來建立系統前台服務，徹底綁定麥克風
+  audio_session: ^0.1.21  # 💡 新增：用來管理音訊焦點，允許與 YouTube 共存
   
   # 檔案與儲存
   path_provider: ^2.1.2
