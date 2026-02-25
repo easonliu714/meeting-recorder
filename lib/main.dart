@@ -18,8 +18,12 @@ import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart'; // 💡 新增
+// 👇 請補上這兩行 👇
+import 'dart:isolate'; // 解決 SendPort 錯誤
+import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
 
-const String APP_VERSION = "1.0.37"; // 💡 新增 STT 多國語言動態設定與防幻覺連動
+const String APP_VERSION = "1.0.38"; // 💡 修改 STT 防幻覺
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,6 +34,24 @@ void main() async {
 }
 
 enum NoteStatus { downloading, processing, success, failed }
+
+// 💡 新增：這是給系統底層看的前台任務處理器
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(MyTaskHandler());
+}
+
+class MyTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {}
+  @override
+  Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {}
+  @override
+  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {}
+  // 👇 請補上這個方法 👇
+  @override
+  Future<void> onRepeatEvent(DateTime timestamp, SendPort? sendPort) async {}
+}
 
 // --- 結構化多語系逐字稿模型 ---
 class TranscriptItem {
@@ -271,25 +293,23 @@ class GroqApi {
       request.fields['language'] = sttLanguage;
     }
 
+    // 💡 修正 1：移除帶有強烈情境的提示詞，避免 Whisper 模型無中生有 (幻覺)
     switch (sttLanguage) {
       case 'zh':
-        request.fields['prompt'] = '好的，我們現在開始開會。討論一下專案進度、系統架構與待辦事項。謝謝大家。';
+        request.fields['prompt'] = '這是一段真實的會議錄音，請精準聽寫內容。';
         break;
       case 'en':
         request.fields['prompt'] =
-            'Hello everyone, let\'s start the meeting. We will discuss the project status and action items. Thank you.';
+            'This is a real meeting recording, please transcribe accurately.';
         break;
       case 'ja':
-        request.fields['prompt'] =
-            'それでは、会議を始めます。プロジェクトの進捗と課題について話し合います。よろしくお願いします。';
+        request.fields['prompt'] = 'これは実際の会議の録音です。正確に文字起こししてください。';
         break;
       case 'ko':
-        request.fields['prompt'] =
-            '자, 회의를 시작하겠습니다. 프로젝트 진행 상황 및 안건에 대해 논의하겠습니다. 감사합니다.';
+        request.fields['prompt'] = '실제 회의 녹음입니다. 정확하게 기록해 주세요.';
         break;
       case 'auto':
       default:
-        // 自動偵測模式下，給予多語系混合提示詞，幫助模型穩定
         request.fields['prompt'] =
             'Meeting transcription. 會議紀錄。会議の文字起こし。회의 기록.';
         break;
@@ -970,11 +990,16 @@ class GlobalManager {
               ? (totalSeconds - chunkStart)
               : chunkSize.toDouble();
 
+          // 💡 修正 2：加入防禦性 Prompt，強制 Gemini 遵守時間軸，且遇到靜音必須捨棄
           String transcriptPrompt = """
-          請扮演一位極度專業的「多語系逐字稿聽打員」，針對 $chunkStart 秒 到 $chunkEnd 秒的音訊提供一字不漏的逐字稿。
-          1. 【強制短句斷點】：單一句子長度超過 10 秒必須斷開。
-          2. 【防範時間軸偏移】：遇到超過 5 秒的空白必須插入系統節點校準時間。
-          請回傳純 JSON 陣列。
+          請扮演極度專業的「多語系逐字稿聽打員」。這是一份長音檔，請你【嚴格且只針對】第 $chunkStart 秒 到第 $chunkEnd 秒的音訊片段提供逐字稿。
+         
+          【極度重要限制】：
+          1. 絕對不可從 0 秒開始聽打！你必須精準從第 $chunkStart 秒的聲音開始。不要重複前面的內容！
+          2. 如果這個片段 ($chunkStart 秒 ~ $chunkEnd 秒) 裡面是「靜音」、「無人說話」或「純環境雜音」，請直接回傳空陣列 []，絕對不要憑空捏造對話！
+          3. 【強制短句斷點】：單一句子長度超過 10 秒必須斷開。
+          
+          請回傳純 JSON 陣列，包含 speaker, original, startTime。
           """;
 
           bool chunkSuccess = false;
@@ -1282,6 +1307,41 @@ class _MainAppShellState extends State<MainAppShell> {
   final List<Widget> pages = [const HomePage(), const SettingsPage()];
 
   @override
+  void initState() {
+    super.initState();
+    _initForegroundTask(); // 💡 新增：初始化背景任務設定
+  }
+
+  // 💡 新增這個方法：設定前台通知的外觀與行為
+  void _initForegroundTask() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'recording_channel',
+        channelName: '會議錄音背景服務',
+        channelDescription: '保持麥克風在背景持續錄音不中斷',
+        channelImportance: NotificationChannelImportance.HIGH,
+        priority: NotificationPriority.HIGH,
+        iconData: const NotificationIconData(
+          resType: ResourceType.mipmap,
+          resPrefix: ResourcePrefix.ic,
+          name: 'launcher',
+        ),
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(
+        showNotification: true,
+        playSound: false,
+      ),
+      foregroundTaskOptions: const ForegroundTaskOptions(
+        interval: 5000,
+        isOnceEvent: false,
+        autoRunOnBoot: false,
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+  }
+
+  @override
   void dispose() {
     timer?.cancel();
     audioRecorder.dispose();
@@ -1301,9 +1361,18 @@ class _MainAppShellState extends State<MainAppShell> {
   Future<void> startRecording() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.microphone,
+      Permission.notification, // 💡 新增這行：要求通知權限，確保前台服務能成功掛起
     ].request();
 
     if (statuses[Permission.microphone]!.isGranted) {
+      // 💡 新增：啟動極致背景前台服務！這會在手機通知欄掛起一個無法被清除的通知，死守麥克風
+      if (await FlutterForegroundTask.isRunningService == false) {
+        await FlutterForegroundTask.startService(
+          notificationTitle: '會議錄音中',
+          notificationText: 'APP 正在背景安全地為您錄製會議...',
+          callback: startCallback,
+        );
+      }
       final dir = await getApplicationDocumentsDirectory();
       final fileName =
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
@@ -1338,7 +1407,9 @@ class _MainAppShellState extends State<MainAppShell> {
       });
 
       GlobalManager.isRecordingNotifier.value = true;
-      GlobalManager.addLog("開始錄音 (32kbps 瘦身模式，確保符合 Groq 大小限制)...");
+      await WakelockPlus.enable(); // 💡 新增：啟動喚醒鎖，防止手機休眠砍掉麥克風
+      GlobalManager.addLog(
+          "開始錄音並啟用 Wakelock 防休眠 (32kbps 瘦身模式，確保符合 Groq 大小限制)...");
     } else {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -1370,7 +1441,12 @@ class _MainAppShellState extends State<MainAppShell> {
     final path = await audioRecorder.stop();
     stopwatch.stop();
     GlobalManager.isRecordingNotifier.value = false;
+    await WakelockPlus.disable(); // 💡 新增：解除喚醒鎖，讓手機能正常休息省電
 
+    // 💡 新增：解除背景前台服務，釋放系統資源
+    if (manualStop) {
+      await FlutterForegroundTask.stopService();
+    }
     if (path != null) {
       String title = manualStop && recordingPart == 1
           ? "會議錄音"
