@@ -19,7 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-const String APP_VERSION = "1.0.35"; // 💡 修復 Whisper 靜音幻覺、增加大批次處理與 STT 匯出
+const String APP_VERSION = "1.0.37"; // 💡 新增 STT 多國語言動態設定與防幻覺連動
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -254,19 +254,46 @@ class UsageTracker {
 
 // --- Groq API (Whisper V3) ---
 class GroqApi {
-  static Future<List<dynamic>> transcribeAudio(
-      String apiKey, File audioFile, double audioDurationSeconds) async {
-    _log("啟動 Groq Whisper V3 引擎進行高精度 STT...");
+  // 💡 接收 sttLanguage 參數
+  static Future<List<dynamic>> transcribeAudio(String apiKey, File audioFile,
+      double audioDurationSeconds, String sttLanguage) async {
+    _log("啟動 Groq Whisper V3 引擎進行高精度 STT (語系: $sttLanguage)...");
     var request = http.MultipartRequest('POST',
         Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
 
     request.headers.addAll({'Authorization': 'Bearer $apiKey'});
     request.fields['model'] = 'whisper-large-v3';
     request.fields['response_format'] = 'verbose_json';
+    request.fields['temperature'] = '0'; // 嚴格抑制幻覺
 
-    // 💡 核心防禦：Temperature 設為 0，嚴格抑制 Whisper 遇到靜音時的廣告詞幻覺
-    request.fields['temperature'] = '0';
-    request.fields['prompt'] = 'Meeting transcription. 會議紀錄。';
+    // 💡 根據設定動態調整語系與情境 Prompt
+    if (sttLanguage != 'auto') {
+      request.fields['language'] = sttLanguage;
+    }
+
+    switch (sttLanguage) {
+      case 'zh':
+        request.fields['prompt'] = '好的，我們現在開始開會。討論一下專案進度、系統架構與待辦事項。謝謝大家。';
+        break;
+      case 'en':
+        request.fields['prompt'] =
+            'Hello everyone, let\'s start the meeting. We will discuss the project status and action items. Thank you.';
+        break;
+      case 'ja':
+        request.fields['prompt'] =
+            'それでは、会議を始めます。プロジェクトの進捗と課題について話し合います。よろしくお願いします。';
+        break;
+      case 'ko':
+        request.fields['prompt'] =
+            '자, 회의를 시작하겠습니다. 프로젝트 진행 상황 및 안건에 대해 논의하겠습니다. 감사합니다.';
+        break;
+      case 'auto':
+      default:
+        // 自動偵測模式下，給予多語系混合提示詞，幫助模型穩定
+        request.fields['prompt'] =
+            'Meeting transcription. 會議紀錄。会議の文字起こし。회의 기록.';
+        break;
+    }
 
     request.files
         .add(await http.MultipartFile.fromPath('file', audioFile.path));
@@ -726,6 +753,8 @@ class GlobalManager {
     final List<String> apiKeys = await getApiKeys();
     String strategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
     final String groqKey = prefs.getString('groq_api_key') ?? '';
+    // 💡 新增：讀取 STT 語言設定，預設為中文
+    final String sttLanguage = prefs.getString('stt_language') ?? 'zh';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
@@ -763,8 +792,8 @@ class GlobalManager {
 
         List<dynamic> whisperSegments = [];
         try {
-          whisperSegments =
-              await GroqApi.transcribeAudio(groqKey, audioFile, totalSeconds);
+          whisperSegments = await GroqApi.transcribeAudio(
+              groqKey, audioFile, totalSeconds, sttLanguage); // 💡 傳入語言參數
         } catch (e) {
           if (e.toString().contains('413') ||
               e.toString().contains('Too Large') ||
@@ -2920,8 +2949,8 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _participantController = TextEditingController();
 
   String _analysisStrategy = 'groq_gemini'; // 預設推薦雙引擎
+  String _sttLanguage = 'zh'; // 💡 新增狀態變數
   bool _isLoadingModels = false;
-  double _monthlyHours = 10.0;
 
   @override
   void initState() {
@@ -2935,6 +2964,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _groqKeyController.text = prefs.getString('groq_api_key') ?? '';
       _analysisStrategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
+      _sttLanguage = prefs.getString('stt_language') ?? 'zh'; // 💡 讀取
     });
   }
 
@@ -2979,6 +3009,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('groq_api_key', _groqKeyController.text);
     await prefs.setString('analysis_strategy', _analysisStrategy);
+    await prefs.setString('stt_language', _sttLanguage); // 💡 寫入
 
     if (mounted) {
       ScaffoldMessenger.of(context)
@@ -3066,6 +3097,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 20),
+
           const Text(
             "分析模式 (AI 核心策略)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -3107,6 +3139,46 @@ class _SettingsPageState extends State<SettingsPage> {
                 fontSize: 12,
                 color: _analysisStrategy == 'pro' ? Colors.red : Colors.green),
           ),
+
+          const SizedBox(height: 20),
+          // 💡 新增：STT 語系選擇下拉選單
+          const Text(
+            "語音辨識主要語言 (STT Language)",
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade400),
+                borderRadius: BorderRadius.circular(8)),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: _sttLanguage,
+                isExpanded: true,
+                items: const [
+                  DropdownMenuItem(
+                      value: 'zh', child: Text("🇹🇼 繁體中文 (預設，適合中英夾雜)")),
+                  DropdownMenuItem(
+                      value: 'en', child: Text("🇺🇸 英文為主 (English)")),
+                  DropdownMenuItem(value: 'ja', child: Text("🇯🇵 日文為主 (日本語)")),
+                  DropdownMenuItem(value: 'ko', child: Text("🇰🇷 韓文為主 (한국어)")),
+                  DropdownMenuItem(
+                      value: 'auto', child: Text("🌐 自動偵測 (無明顯主導語言時使用)")),
+                ],
+                onChanged: (val) {
+                  setState(() => _sttLanguage = val!);
+                  _saveSettings();
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            "💡 提示：若會議有明確主導語言請明確選擇，可極大化消滅 STT 幻覺。",
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+
           const SizedBox(height: 20),
           Card(
             color: Colors.blue.shade50,
@@ -3164,6 +3236,7 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
           ),
+
           const SizedBox(height: 20),
           const Text(
             "預設與會者 (常用名單)",
