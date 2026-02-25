@@ -24,7 +24,7 @@ import 'dart:isolate'; // 解決 SendPort 錯誤
 import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
 import 'package:audio_session/audio_session.dart' as as_lib; // 💡 新增
 
-const String APP_VERSION = "1.0.39"; // 💡 增加混音模式
+const String APP_VERSION = "1.0.40"; // 💡 修改混音模式，增加等待重試計時器
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -468,8 +468,9 @@ class GeminiRestApi {
             break;
           }
 
-          if (response.statusCode != 200)
+          if (response.statusCode != 200) {
             throw Exception('Generate failed: ${response.body}');
+          }
 
           await UsageTracker.addGeminiAudioSeconds(audioChunkDuration);
 
@@ -1029,8 +1030,9 @@ class GlobalManager {
             } catch (e) {
               if (e.toString().contains("RESOURCE_EXHAUSTED")) {
                 currentKeyIndex++;
-                if (currentKeyIndex >= apiKeys.length)
+                if (currentKeyIndex >= apiKeys.length) {
                   throw Exception("所有 API Key 均已耗盡！");
+                }
 
                 lockedKey = apiKeys[currentKeyIndex];
                 _log("🔄 額度滿載！無縫切換 Key ${_maskKey(lockedKey)}，正在重新上傳音檔...");
@@ -1305,6 +1307,8 @@ class _MainAppShellState extends State<MainAppShell> {
   int recordingPart = 1;
   DateTime? recordingSessionStartTime;
 
+  bool _isSystemInterrupted = false; // 💡 新增：用來追蹤是否正在等待資源釋放
+
   final List<Widget> pages = [const HomePage(), const SettingsPage()];
 
   @override
@@ -1386,16 +1390,21 @@ class _MainAppShellState extends State<MainAppShell> {
         androidAudioAttributes: as_lib.AndroidAudioAttributes(
           contentType: as_lib.AndroidAudioContentType.speech,
           flags: as_lib.AndroidAudioFlags.none,
-          usage: as_lib.AndroidAudioUsage.voiceCommunication,
+          usage: as_lib.AndroidAudioUsage
+              .media, // 💡 修正1：改為 media，避免系統誤以為在講電話而阻擋 YouTube
         ),
-        androidAudioFocusGainType: as_lib.AndroidAudioFocusGainType.gain,
         androidWillPauseWhenDucked: false,
       ));
+
+      await session
+          .setActive(true); // 💡 修正3：必須呼叫這行！iOS 才會套用混音，Android 則會默默套用不搶焦點的設定
 
       final dir = await getApplicationDocumentsDirectory();
       final fileName =
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
       final path = '${dir.path}/$fileName';
+
+      _isSystemInterrupted = false; // 💡 新增：每次手動開始前，重置中斷狀態
 
       await audioRecorder.start(
         const RecordConfig(
@@ -1403,7 +1412,7 @@ class _MainAppShellState extends State<MainAppShell> {
           bitRate: 32000,
           sampleRate: 16000,
           numChannels: 1,
-          autoGain: true,
+          autoGain: false, // 💡 修正4：關閉自動增益，讓麥克風回歸最純粹的收音模式，不再與喇叭互斥
           echoCancel: false,
           noiseSuppress: false,
         ),
@@ -1413,14 +1422,71 @@ class _MainAppShellState extends State<MainAppShell> {
       stopwatch.reset();
       stopwatch.start();
 
+      // 👇👇👇 替換整個 timer 區塊 👇👇👇
       timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
         if (!mounted) return;
+
+        bool isStillRecording = await audioRecorder.isRecording();
+
+        // 💡 神技：偵測到麥克風異常中斷 (例如接電話、開啟其他強佔音訊的 APP)
+        if (!isStillRecording && GlobalManager.isRecordingNotifier.value) {
+          if (!_isSystemInterrupted) {
+            // 剛被中斷的瞬間：立刻存檔當前段落
+            _isSystemInterrupted = true;
+            stopwatch.stop(); // 暫停 UI 計時
+            GlobalManager.addLog("⚠️ 麥克風遭系統強制收回，保存目前進度，進入自動重試模式...");
+
+            try {
+              final path = await audioRecorder.stop();
+              if (path != null) {
+                String title = "會議錄音 Part $recordingPart (被中斷前)";
+                createNewNoteAndAnalyze(path, title, date: DateTime.now());
+              }
+            } catch (_) {}
+
+            recordingPart++; // 為下一次恢復做準備
+          } else {
+            // 已經在中斷狀態，每 3 秒嘗試敲門奪回麥克風權限
+            if (timer.tick % 3 == 0) {
+              try {
+                final dir = await getApplicationDocumentsDirectory();
+                final fileName =
+                    "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
+                final resumePath = '${dir.path}/$fileName';
+
+                await audioRecorder.start(
+                  const RecordConfig(
+                    encoder: AudioEncoder.aacLc,
+                    bitRate: 32000,
+                    sampleRate: 16000,
+                    numChannels: 1,
+                    autoGain: false,
+                    echoCancel: false,
+                    noiseSuppress: false,
+                  ),
+                  path: resumePath,
+                );
+                // 成功搶回！恢復正常狀態
+                _isSystemInterrupted = false;
+                stopwatch.start(); // 繼續 UI 計時
+                GlobalManager.addLog(
+                    "✅ 成功搶回麥克風權限！自動恢復錄音 (Part $recordingPart)");
+              } catch (e) {
+                // 搶奪失敗，資源還沒釋放，繼續無聲等待...
+              }
+            }
+          }
+          return; // 異常期間不更新計時器文字
+        }
+
+        // 正常錄音狀態：更新 UI
         setState(() {
           timerText =
               "${stopwatch.elapsed.inMinutes.toString().padLeft(2, '0')}:${(stopwatch.elapsed.inSeconds % 60).toString().padLeft(2, '0')}";
         });
 
-        if (stopwatch.elapsed.inMinutes >= 60) {
+        // 正常狀態下，滿 60 分鐘自動分段
+        if (stopwatch.elapsed.inMinutes >= 60 && !_isSystemInterrupted) {
           await handleAutoSplit();
         }
       });
