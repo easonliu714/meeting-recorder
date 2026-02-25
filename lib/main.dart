@@ -24,7 +24,7 @@ import 'dart:isolate'; // 解決 SendPort 錯誤
 import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
 import 'package:audio_session/audio_session.dart' as as_lib; // 💡 新增
 
-const String APP_VERSION = "1.0.43"; // 💡 修正偵測靜音通知與點擊開啟APP恢復錄音功能
+const String APP_VERSION = "1.0.44"; // 💡 增加分貝值除錯訊息
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1362,8 +1362,10 @@ class _MainAppShellState extends State<MainAppShell>
     setState(() {
       if (state == AppLifecycleState.resumed) {
         _isAppInForeground = true; // 回到 APP 畫面
+        GlobalManager.addLog("📱 [生命週期] APP 回到前景 (Resumed)"); // 💡 新增追蹤
       } else {
         _isAppInForeground = false; // 離開 APP (包含退到桌面、鎖屏、上拉選單等)
+        GlobalManager.addLog("📱 [生命週期] APP 進入背景 ($state)"); // 💡 新增追蹤
       }
     });
   }
@@ -1451,7 +1453,14 @@ class _MainAppShellState extends State<MainAppShell>
         if (isStillRecording && !_isSystemInterrupted) {
           try {
             final amp = await audioRecorder.getAmplitude();
-            if (amp.current <= -150.0) {
+            // 💡 新增：每 2 秒印出一次除錯資訊，避免洗版，同時保留高解析度監控
+            if (timer.tick % 2 == 0) {
+              GlobalManager.addLog(
+                  "📊 [監控] 前景: $_isAppInForeground | 分貝: ${amp.current.toStringAsFixed(2)} dB | 空跑: $_deadMicCounter 秒");
+            }
+
+            // 💡 調整：我們先將閾值設為 -100.0，後續可依據日誌測出的真實極限值再做微調
+            if (amp.current <= -100.0) {
               _deadMicCounter++;
             } else {
               _deadMicCounter = 0;
