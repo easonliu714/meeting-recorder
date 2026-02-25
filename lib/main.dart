@@ -24,7 +24,7 @@ import 'dart:isolate'; // 解決 SendPort 錯誤
 import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
 import 'package:audio_session/audio_session.dart' as as_lib; // 💡 新增
 
-const String APP_VERSION = "1.0.41"; // 💡 增加錄音停止通知與點擊開啟APP恢復錄音功能
+const String APP_VERSION = "1.0.43"; // 💡 修正偵測靜音通知與點擊開啟APP恢復錄音功能
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1292,7 +1292,9 @@ class MainAppShell extends StatefulWidget {
   State<MainAppShell> createState() => _MainAppShellState();
 }
 
-class _MainAppShellState extends State<MainAppShell> {
+// 💡 修改：加上 with WidgetsBindingObserver 讓 APP 可以感知自己是在前景還是背景
+class _MainAppShellState extends State<MainAppShell>
+    with WidgetsBindingObserver {
   int currentIndex = 0;
   final AudioRecorder audioRecorder = AudioRecorder();
   final Stopwatch stopwatch = Stopwatch();
@@ -1304,12 +1306,16 @@ class _MainAppShellState extends State<MainAppShell> {
   // 👇 💡 新增這兩個變數，用來控制中斷與恢復邏輯 👇
   bool _isSystemInterrupted = false; // 💡 新增：用來追蹤是否正在等待資源釋放
   bool _isRecovering = false;
+  int _deadMicCounter = 0; // 💡 新增：用來追蹤連續空跑(絕對靜音)的秒數
+  // 💡 新增：追蹤 APP 是否在畫面上
+  bool _isAppInForeground = true;
 
   final List<Widget> pages = [const HomePage(), const SettingsPage()];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // 💡 新增：註冊觀察者
     _initForegroundTask(); // 💡 新增：初始化背景任務設定
   }
 
@@ -1344,9 +1350,22 @@ class _MainAppShellState extends State<MainAppShell> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this); // 💡 新增：移除觀察者
     timer?.cancel();
     audioRecorder.dispose();
     super.dispose();
+  }
+
+  // 💡 新增：當 APP 被退到背景、或切換到其他 APP 時，系統會自動呼叫這個方法
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    setState(() {
+      if (state == AppLifecycleState.resumed) {
+        _isAppInForeground = true; // 回到 APP 畫面
+      } else {
+        _isAppInForeground = false; // 離開 APP (包含退到桌面、鎖屏、上拉選單等)
+      }
+    });
   }
 
   void toggleRecording() async {
@@ -1401,6 +1420,7 @@ class _MainAppShellState extends State<MainAppShell> {
       final path = '${dir.path}/$fileName';
 
       _isSystemInterrupted = false; // 💡 新增：每次手動開始前，重置中斷狀態
+      _deadMicCounter = 0; // 💡 每次手動開始前，重置計數器
 
       await audioRecorder.start(
         const RecordConfig(
@@ -1418,35 +1438,55 @@ class _MainAppShellState extends State<MainAppShell> {
       stopwatch.reset();
       stopwatch.start();
 
-      // 👇👇👇 替換整個 timer 區塊 👇👇👇
+      // 👇👇👇 將原本的 timer 整個替換成這個 👇👇👇
       timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
         if (!mounted) return;
 
-        if (_isRecovering) return; // 💡 正在嘗試恢復中，跳過此秒的檢查防重疊
+        if (_isRecovering) return; // 正在嘗試恢復中，跳過此秒
 
         bool isStillRecording = await audioRecorder.isRecording();
+        bool isMicDead = false;
 
-        // 💡 系統中斷觸發區
-        if (!isStillRecording && GlobalManager.isRecordingNotifier.value) {
+        // 💡 監控「空跑/被靜音」：檢查麥克風分貝是否為絕對死寂 (<= -150dB)
+        if (isStillRecording && !_isSystemInterrupted) {
+          try {
+            final amp = await audioRecorder.getAmplitude();
+            if (amp.current <= -150.0) {
+              _deadMicCounter++;
+            } else {
+              _deadMicCounter = 0;
+            }
+
+            // 💡 關鍵修改：連續 3 秒死寂 且 APP 在背景，才觸發救援機制！
+            if (_deadMicCounter >= 3 && !_isAppInForeground) {
+              isMicDead = true;
+            }
+          } catch (_) {}
+        }
+
+        // 💡 系統中斷觸發區 (真的沒在錄，或者陷入空跑被靜音狀態)
+        if ((!isStillRecording || isMicDead) &&
+            GlobalManager.isRecordingNotifier.value) {
           if (!_isSystemInterrupted) {
             _isSystemInterrupted = true;
+            _deadMicCounter = 0; // 重置計數器
             stopwatch.stop();
-            GlobalManager.addLog("⚠️ 麥克風遭系統強制收回，保存進度並進入等待模式...");
+            GlobalManager.addLog("⚠️ 偵測到麥克風遭系統強制收回(空跑)，保存進度並進入等待模式...");
 
-            // 💡 智能通知：告訴使用者發生了什麼事
+            // 💡 智能通知：引導使用者點擊回 APP 恢復
             FlutterForegroundTask.updateService(
               notificationTitle: '⚠️ 錄音被系統暫停',
-              notificationText: '請關閉 YouTube 或點擊回 APP 恢復錄音',
+              notificationText: '請點擊回到 APP 即可自動恢復錄音',
             );
 
             try {
               final path = await audioRecorder.stop();
-              // 如果錄段大於 2 秒才保存，避免產生一堆 0 秒垃圾檔案
-              if (path != null && stopwatch.elapsed.inSeconds >= 2) {
+              // 如果錄段大於 4 秒才保存 (扣掉剛才偵測空跑的 3 秒)
+              if (path != null && stopwatch.elapsed.inSeconds >= 4) {
                 String title = "會議錄音 Part $recordingPart (被中斷)";
                 createNewNoteAndAnalyze(path, title, date: DateTime.now());
               } else if (path != null) {
-                File(path).delete().catchError((_) {}); // 刪除無用短檔
+                File(path).delete().catchError((_) {});
               }
             } catch (e) {
               GlobalManager.addLog("保存舊檔發生異常: $e");
@@ -1454,23 +1494,20 @@ class _MainAppShellState extends State<MainAppShell> {
 
             recordingPart++;
           } else {
-            // 💡 中斷狀態中：每 3 秒敲門一次，看系統還麥克風了沒
+            // 💡 中斷狀態中：每 3 秒敲門一次
             if (timer.tick % 3 == 0) {
               _isRecovering = true;
               try {
                 GlobalManager.addLog("🔄 嘗試搶回麥克風權限...");
 
-                // 1. 重新宣告 AudioSession，拿回音訊權
                 final session = await as_lib.AudioSession.instance;
                 await session.setActive(true);
 
-                // 2. 建立新段落檔案
                 final dir = await getApplicationDocumentsDirectory();
                 final fileName =
                     "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
                 final resumePath = '${dir.path}/$fileName';
 
-                // 3. 嘗試啟動
                 await audioRecorder.start(
                   const RecordConfig(
                     encoder: AudioEncoder.aacLc,
@@ -1484,30 +1521,38 @@ class _MainAppShellState extends State<MainAppShell> {
                   path: resumePath,
                 );
 
-                // 4. 等待 500ms 驗證是否真的活著 (防止被系統秒殺)
-                await Future.delayed(const Duration(milliseconds: 500));
-                if (await audioRecorder.isRecording()) {
+                // 💡 等待 1 秒驗證是否真的活著且有聲音，不再被騙
+                await Future.delayed(const Duration(seconds: 1));
+                bool alive = await audioRecorder.isRecording();
+                if (alive) {
+                  final amp = await audioRecorder.getAmplitude();
+                  if (amp.current <= -150.0) {
+                    alive = false; // 依然是空跑，視為失敗
+                  }
+                }
+
+                if (alive) {
                   _isSystemInterrupted = false;
-                  stopwatch.reset(); // 💡 新段落重新計時 00:00
+                  _deadMicCounter = 0;
+                  stopwatch.reset();
                   stopwatch.start();
                   GlobalManager.addLog("✅ 成功恢復錄音 (Part $recordingPart)");
 
-                  // 💡 恢復通知
                   FlutterForegroundTask.updateService(
                     notificationTitle: '會議錄音中',
                     notificationText: '已自動接續錄製 (Part $recordingPart)',
                   );
                 } else {
-                  await audioRecorder.stop(); // 搶奪失敗，清理並等待下一次 3 秒
+                  await audioRecorder.stop(); // 搶奪失敗，等下一個 3 秒
                 }
               } catch (e) {
-                GlobalManager.addLog("❌ 恢復重試被拒絕: $e (需回到前台)");
+                GlobalManager.addLog("❌ 恢復重試被拒絕");
               } finally {
                 _isRecovering = false;
               }
             }
           }
-          return; // 異常期間不更新 UI 計時器
+          return;
         }
 
         // --- 正常狀態 ---
@@ -1586,6 +1631,7 @@ class _MainAppShellState extends State<MainAppShell> {
       timerText = "00:00";
       _isSystemInterrupted = false; // 恢復預設
       _isRecovering = false;
+      _deadMicCounter = 0; // 💡 確保停止後歸零
     });
   }
 
