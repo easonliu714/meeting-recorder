@@ -18,13 +18,14 @@ import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
-import 'package:flutter_foreground_task/flutter_foreground_task.dart'; // 💡 新增
-// 👇 請補上這兩行 👇
-import 'dart:isolate'; // 解決 SendPort 錯誤
-import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
-import 'package:audio_session/audio_session.dart' as as_lib; // 💡 新增
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'dart:isolate';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:audio_session/audio_session.dart' as as_lib;
 
-const String APP_VERSION = "1.0.45"; // 💡 增加分貝值除錯訊息,分貝值凍結判定
+// 👇 1.0.46 修改開始：更新版本號 👇
+const String APP_VERSION = "1.0.46"; // 💡 支援多段錄音合併與背景暫停接續
+// 👆 1.0.46 修改結束 👆
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -36,7 +37,6 @@ void main() async {
 
 enum NoteStatus { downloading, processing, success, failed }
 
-// 💡 新增：這是給系統底層看的前台任務處理器
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(MyTaskHandler());
@@ -49,7 +49,6 @@ class MyTaskHandler extends TaskHandler {
   Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {}
   @override
   Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {}
-  // 👇 請補上這個方法 👇
   @override
   Future<void> onRepeatEvent(DateTime timestamp, SendPort? sendPort) async {}
 }
@@ -163,6 +162,11 @@ class MeetingNote {
   String title;
   DateTime date;
   String audioPath;
+
+  // 👇 1.0.46 修改開始：支援多段錄音合併 👇
+  List<String> audioParts;
+  // 👆 1.0.46 修改結束 👆
+
   List<String> summary;
   List<TaskItem> tasks;
   List<TranscriptItem> transcript;
@@ -176,6 +180,7 @@ class MeetingNote {
     required this.title,
     required this.date,
     required this.audioPath,
+    this.audioParts = const [], // 💡 新增
     this.summary = const [],
     this.tasks = const [],
     this.transcript = const [],
@@ -190,6 +195,7 @@ class MeetingNote {
         'title': title,
         'date': date.toIso8601String(),
         'audioPath': audioPath,
+        'audioParts': audioParts, // 💡 新增
         'summary': summary,
         'tasks': tasks.map((e) => e.toJson()).toList(),
         'transcript': transcript.map((e) => e.toJson()).toList(),
@@ -204,7 +210,15 @@ class MeetingNote {
       id: json['id'],
       title: json['title'],
       date: DateTime.parse(json['date']),
-      audioPath: json['audioPath'],
+      audioPath: json['audioPath'] ?? '',
+      // 👇 1.0.46 修改開始：向下相容舊資料 👇
+      audioParts: (json['audioParts'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          (json['audioPath'] != null && json['audioPath'].toString().isNotEmpty
+              ? [json['audioPath']]
+              : []),
+      // 👆 1.0.46 修改結束 👆
       summary: List<String>.from(json['summary'] ?? []),
       tasks: (json['tasks'] as List<dynamic>?)
               ?.map((e) => TaskItem.fromJson(e))
@@ -244,7 +258,14 @@ class UsageTracker {
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     String? dateStr = prefs.getString('usage_first_date');
-    firstUseDate = DateTime.tryParse(dateStr!);
+    if (dateStr != null) {
+      firstUseDate = DateTime.tryParse(dateStr);
+    }
+    if (firstUseDate == null) {
+      firstUseDate = DateTime.now();
+      await prefs.setString(
+          'usage_first_date', firstUseDate!.toIso8601String());
+    }
     groqAudioSeconds = prefs.getDouble('usage_groq_seconds') ?? 0;
     geminiTextRequests = prefs.getInt('usage_gemini_texts') ?? 0;
     geminiAudioSeconds = prefs.getDouble('usage_gemini_audio_seconds') ?? 0;
@@ -269,9 +290,7 @@ class UsageTracker {
   }
 }
 
-// --- Groq API (Whisper V3) ---
 class GroqApi {
-  // 💡 接收 sttLanguage 參數
   static Future<List<dynamic>> transcribeAudio(String apiKey, File audioFile,
       double audioDurationSeconds, String sttLanguage) async {
     _log("啟動 Groq Whisper V3 引擎進行高精度 STT (語系: $sttLanguage)...");
@@ -281,14 +300,12 @@ class GroqApi {
     request.headers.addAll({'Authorization': 'Bearer $apiKey'});
     request.fields['model'] = 'whisper-large-v3';
     request.fields['response_format'] = 'verbose_json';
-    request.fields['temperature'] = '0'; // 嚴格抑制幻覺
+    request.fields['temperature'] = '0';
 
-    // 💡 根據設定動態調整語系與情境 Prompt
     if (sttLanguage != 'auto') {
       request.fields['language'] = sttLanguage;
     }
 
-    // 💡 修正 1：移除帶有強烈情境的提示詞，避免 Whisper 模型無中生有 (幻覺)
     switch (sttLanguage) {
       case 'zh':
         request.fields['prompt'] = '這是一段真實的會議錄音，請精準聽寫內容。';
@@ -742,6 +759,11 @@ class GlobalManager {
             await f.delete();
             _log("已徹底刪除機密音檔: ${f.path}");
           }
+          // 同步刪除多個 Parts
+          for (var p in target.audioParts) {
+            final pf = await getActualFile(p);
+            if (await pf.exists()) await pf.delete();
+          }
         } catch (_) {}
       }
 
@@ -769,7 +791,6 @@ class GlobalManager {
     final List<String> apiKeys = await getApiKeys();
     String strategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
     final String groqKey = prefs.getString('groq_api_key') ?? '';
-    // 💡 新增：讀取 STT 語言設定，預設為中文
     final String sttLanguage = prefs.getString('stt_language') ?? 'zh';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
@@ -781,98 +802,90 @@ class GlobalManager {
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
 
-      final audioFile = await getActualFile(note.audioPath);
-      if (!await audioFile.exists()) throw Exception("找不到音訊檔案");
-
-      final int fileSize = await audioFile.length();
-      final double fileSizeMB = fileSize / (1024 * 1024);
-      final bool isOversized = fileSizeMB >= 25.0;
-
+      // 👇 1.0.46 修改開始：替換為多檔分析與時間偏移邏輯 👇
+      List<String> targetParts =
+          note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
+      double globalOffsetSeconds = 0.0;
+      List<dynamic> allWhisperSegments = [];
       bool useGeminiFallback = false;
 
-      final tempPlayer = AudioPlayer();
-      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
-      final duration = await tempPlayer.getDuration();
-      await tempPlayer.dispose();
-      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
-
       if (strategy == 'groq_gemini') {
-        if (isOversized) {
-          _log(
-              "⚠️ 檔案大小 (${fileSizeMB.toStringAsFixed(1)}MB) 超過 Groq 建議限制。系統將先嘗試上傳，若失敗將無縫降級至原生引擎。");
-        }
         if (groqKey.isEmpty) throw Exception("選擇了高精度雙引擎，但未設定 Groq API Key");
 
-        note.currentStep = "Groq STT 引擎分析中...";
-        await saveNote(note);
+        for (int i = 0; i < targetParts.length; i++) {
+          final partFile = await getActualFile(targetParts[i]);
+          if (!await partFile.exists()) continue;
 
-        List<dynamic> whisperSegments = [];
-        try {
-          whisperSegments = await GroqApi.transcribeAudio(
-              groqKey, audioFile, totalSeconds, sttLanguage); // 💡 傳入語言參數
-        } catch (e) {
-          if (e.toString().contains('413') ||
-              e.toString().contains('Too Large') ||
-              isOversized) {
-            _log("❌ Groq 拒絕處理大型檔案。準備無縫切換至 Gemini 原生引擎...");
+          final tempPlayer = AudioPlayer();
+          await tempPlayer.setSource(DeviceFileSource(partFile.path));
+          final durationObj = await tempPlayer.getDuration();
+          await tempPlayer.dispose();
+          double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
+
+          if (partFile.lengthSync() / (1024 * 1024) >= 25.0) {
             useGeminiFallback = true;
-          } else {
-            rethrow;
+            break; // 超大檔案轉交原生備案
           }
+
+          note.currentStep = "Groq 聽寫中 (段落 ${i + 1}/${targetParts.length})...";
+          await saveNote(note);
+
+          try {
+            var segments = await GroqApi.transcribeAudio(
+                groqKey, partFile, partSecs, sttLanguage);
+            for (var seg in segments) {
+              // 💡 核心拼接魔法：把每段的時間加上上一段的總長度
+              seg['start'] =
+                  (seg['start'] as num).toDouble() + globalOffsetSeconds;
+              allWhisperSegments.add(seg);
+            }
+          } catch (e) {
+            _log("Groq 處理段落 ${i + 1} 失敗: $e，轉用原生引擎...");
+            useGeminiFallback = true;
+            break;
+          }
+          globalOffsetSeconds += partSecs;
         }
 
-        if (!useGeminiFallback) {
-          if (whisperSegments.isEmpty) throw Exception("音檔無內容或辨識失敗");
-
-          List<TranscriptItem> rawTranscript = whisperSegments.map((seg) {
+        if (!useGeminiFallback && allWhisperSegments.isNotEmpty) {
+          // 彙整所有段落的原始逐字稿
+          List<TranscriptItem> rawTranscript = allWhisperSegments.map((seg) {
             return TranscriptItem(
               speaker: 'System',
               original: seg['text'],
-              startTime: (seg['start'] as num).toDouble(),
+              startTime: seg['start'], // 已經是偏移過的時間！
             );
           }).toList();
-
           note.transcript = rawTranscript;
           await saveNote(note);
 
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
-
-          int totalSegments = whisperSegments.length;
-          // 💡 核心優化：將批次大幅拉高到 150 句，最大化降低 API 呼叫次數
           int batchSize = 150;
-          int totalBatches = (totalSegments / batchSize).ceil();
+          int totalBatches = (allWhisperSegments.length / batchSize).ceil();
           int chunkCount = 0;
 
-          note.currentStep = "Gemini 講者辨識 (0/$totalBatches)...";
-          await saveNote(note);
-
-          for (var i = 0; i < totalSegments; i++) {
-            var seg = whisperSegments[i];
+          for (var i = 0; i < allWhisperSegments.length; i++) {
+            var seg = allWhisperSegments[i];
             currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
 
-            if ((i + 1) % batchSize == 0 || i == totalSegments - 1) {
+            if ((i + 1) % batchSize == 0 ||
+                i == allWhisperSegments.length - 1) {
               chunkCount++;
-
               note.currentStep = "Gemini 講者辨識 ($chunkCount/$totalBatches)...";
               await saveNote(note);
 
-              // 💡 修正 3：加入防呆指令，強迫 Gemini 刪除 STT 產生的無意義幻覺
-              // 💡 修改：加強版 Prompt，過濾特定的 Prompt 迴圈幻覺，並強化字典修正
               String textPrompt = """
               以下是外部 STT 引擎產生的純文字逐字稿（帶有精準時間戳）：
               ---
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【刪除 Prompt 迴圈幻覺】：若出現「請精準聽寫內容」、「這是一段真實的會議錄音」或類似的重複語句，這是系統產生的雜訊，請務必「整句刪除」，視為靜音。
-              2. 【終極幻覺過濾】：YouTube 廣告詞、版權宣告、無意義重複詞 (如 you you you) 一律刪除。
-              3. 【強制字典修正】：參考專有詞彙庫：${vocabList.join(', ')}。
-                 - 請找出逐字稿中發音相近的錯字，並「強制」修正為詞彙庫中的正確用詞。
-                 - 例如：若詞彙庫有「Reflow」，而逐字稿是「回流」或「微波」，請直接改為「Reflow」。
+              1. 【刪除 Prompt 迴圈幻覺】：若出現「請精準聽寫內容」、「這是一段真實的會議錄音」或類似的重複語句，直接整句刪除。
+              2. 【終極幻覺過濾】：YouTube 廣告詞、無意義重複單字一律刪除。
+              3. 【強制字典修正】：參考專有詞彙庫：${vocabList.join(', ')}。找出發音相近的錯字並強制修正。
               4. 參考最新與會者名單：${participantList.join(', ')}，判斷說話者。
-              5. 若整句話是外文，請翻譯成繁體中文放進 translation 欄位。
-              6. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
+              5. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
               
               回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。若該批次全部都是垃圾幻覺，請回傳 []。
               """;
@@ -890,18 +903,12 @@ class GlobalManager {
                       .map((e) => TranscriptItem.fromJson(e))
                       .toList());
                 }
-
-                currentChunk.clear();
-                _log("已完成第 $chunkCount/$totalBatches 批次講者辨識。");
               } catch (e) {
                 _log("⚠️ 第 $chunkCount 批次講者辨識失敗跳過: $e");
-                currentChunk.clear();
-                continue;
               }
+              currentChunk.clear();
             }
           }
-
-          // 如果全部被過濾掉或失敗，至少保留 rawTranscript；否則覆蓋成處理好的
           if (fullTranscript.isNotEmpty) {
             note.transcript = fullTranscript;
           }
@@ -912,8 +919,9 @@ class GlobalManager {
           return;
         }
       }
+      // 👆 1.0.46 修改結束 👆
 
-      // --- Gemini 原生語音處理模式 ---
+      // --- Gemini 原生語音處理模式 (如果超大檔備案，僅取第一段處理避免爆炸) ---
       if (strategy != 'groq_gemini' || useGeminiFallback) {
         modelsToTry = strategy == 'pro'
             ? ['gemini-pro-latest', 'gemini-2.5-pro']
@@ -922,8 +930,15 @@ class GlobalManager {
         int currentKeyIndex = 0;
         String lockedKey = apiKeys[currentKeyIndex];
 
-        int chunkSize = strategy == 'pro' ? 120 : 300;
+        final audioFile = await getActualFile(
+            targetParts.isNotEmpty ? targetParts.first : note.audioPath);
+        final tempPlayer = AudioPlayer();
+        await tempPlayer.setSource(DeviceFileSource(audioFile.path));
+        final duration = await tempPlayer.getDuration();
+        await tempPlayer.dispose();
+        double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
 
+        int chunkSize = strategy == 'pro' ? 120 : 300;
         if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
         int maxChunks = (totalSeconds / chunkSize).ceil();
         if (maxChunks == 0) maxChunks = 1;
@@ -986,7 +1001,6 @@ class GlobalManager {
               ? (totalSeconds - chunkStart)
               : chunkSize.toDouble();
 
-          // 💡 修正 2：加入防禦性 Prompt，強制 Gemini 遵守時間軸，且遇到靜音必須捨棄
           String transcriptPrompt = """
           請扮演極度專業的「多語系逐字稿聽打員」。這是一份長音檔，請你【嚴格且只針對】第 $chunkStart 秒 到第 $chunkEnd 秒的音訊片段提供逐字稿。
          
@@ -1172,13 +1186,23 @@ class GlobalManager {
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
 
-      final audioFile = await getActualFile(note.audioPath);
-      final tempPlayer = AudioPlayer();
-      await tempPlayer.setSource(DeviceFileSource(audioFile.path));
-      final duration = await tempPlayer.getDuration();
-      await tempPlayer.dispose();
-      double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
+      // 👇 1.0.46 修改開始：重摘要時支援合併後的總秒數計算 👇
+      double totalSeconds = 0.0;
+      List<String> paths =
+          note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
+      for (String p in paths) {
+        if (p.isEmpty) continue;
+        File f = await getActualFile(p);
+        if (await f.exists()) {
+          final tempP = AudioPlayer();
+          await tempP.setSource(DeviceFileSource(f.path));
+          final d = await tempP.getDuration();
+          totalSeconds += (d?.inMilliseconds ?? 0) / 1000.0;
+          await tempP.dispose();
+        }
+      }
       if (totalSeconds <= 0) totalSeconds = 120.0 * 36;
+      // 👆 1.0.46 修改結束 👆
 
       StringBuffer sb = StringBuffer();
       for (var t in note.transcript) {
@@ -1188,7 +1212,6 @@ class GlobalManager {
 
       if (transcriptText.trim().isEmpty) throw Exception("逐字稿為空，無法摘要");
 
-      // 💡 修正 4：防止摘要腦補不存在的人事物
       String prompt = """
       以下是會議逐字稿：
       ---
@@ -1292,7 +1315,6 @@ class MainAppShell extends StatefulWidget {
   State<MainAppShell> createState() => _MainAppShellState();
 }
 
-// 💡 修改：加上 with WidgetsBindingObserver 讓 APP 可以感知自己是在前景還是背景
 class _MainAppShellState extends State<MainAppShell>
     with WidgetsBindingObserver {
   int currentIndex = 0;
@@ -1303,26 +1325,27 @@ class _MainAppShellState extends State<MainAppShell>
   int recordingPart = 1;
   DateTime? recordingSessionStartTime;
 
-  // 👇 💡 新增這兩個變數，用來控制中斷與恢復邏輯 👇
-  bool _isSystemInterrupted = false; // 💡 新增：用來追蹤是否正在等待資源釋放
+  bool _isSystemInterrupted = false;
   bool _isRecovering = false;
-  int _deadMicCounter = 0; // 💡 新增：用來追蹤連續空跑(絕對靜音)的秒數
-  // 👇 💡 新增：用來追蹤分貝是否「凍結」
+  int _deadMicCounter = 0;
   double _lastAmplitude = 0.0;
   int _frozenMicCounter = 0;
-  // 💡 新增：追蹤 APP 是否在畫面上
   bool _isAppInForeground = true;
+
+  // 👇 1.0.46 修改開始：多段暫存與等待狀態 👇
+  List<String> _sessionAudioParts = [];
+  bool _isWaitingForUserResume = false;
+  // 👆 1.0.46 修改結束 👆
 
   final List<Widget> pages = [const HomePage(), const SettingsPage()];
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // 💡 新增：註冊觀察者
-    _initForegroundTask(); // 💡 新增：初始化背景任務設定
+    WidgetsBinding.instance.addObserver(this);
+    _initForegroundTask();
   }
 
-  // 💡 新增這個方法：設定前台通知的外觀與行為
   void _initForegroundTask() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
@@ -1353,22 +1376,21 @@ class _MainAppShellState extends State<MainAppShell>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this); // 💡 新增：移除觀察者
+    WidgetsBinding.instance.removeObserver(this);
     timer?.cancel();
     audioRecorder.dispose();
     super.dispose();
   }
 
-  // 💡 新增：當 APP 被退到背景、或切換到其他 APP 時，系統會自動呼叫這個方法
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     setState(() {
       if (state == AppLifecycleState.resumed) {
-        _isAppInForeground = true; // 回到 APP 畫面
-        GlobalManager.addLog("📱 [生命週期] APP 回到前景 (Resumed)"); // 💡 新增追蹤
+        _isAppInForeground = true;
+        GlobalManager.addLog("📱 [生命週期] APP 回到前景 (Resumed)");
       } else {
-        _isAppInForeground = false; // 離開 APP (包含退到桌面、鎖屏、上拉選單等)
-        GlobalManager.addLog("📱 [生命週期] APP 進入背景 ($state)"); // 💡 新增追蹤
+        _isAppInForeground = false;
+        GlobalManager.addLog("📱 [生命週期] APP 進入背景 ($state)");
       }
     });
   }
@@ -1386,11 +1408,10 @@ class _MainAppShellState extends State<MainAppShell>
   Future<void> startRecording() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.microphone,
-      Permission.notification, // 💡 新增這行：要求通知權限，確保前台服務能成功掛起
+      Permission.notification,
     ].request();
 
     if (statuses[Permission.microphone]!.isGranted) {
-      // 💡 新增：啟動極致背景前台服務！這會在手機通知欄掛起一個無法被清除的通知，死守麥克風
       if (await FlutterForegroundTask.isRunningService == false) {
         await FlutterForegroundTask.startService(
           notificationTitle: '會議錄音中',
@@ -1398,34 +1419,31 @@ class _MainAppShellState extends State<MainAppShell>
           callback: startCallback,
         );
       }
-      // 👇👇👇 💡 新增：設定 AudioSession，允許與其他 App (如 YouTube) 混音 👇👇👇
       final session = await as_lib.AudioSession.instance;
       await session.configure(as_lib.AudioSessionConfiguration(
         avAudioSessionCategory: as_lib.AVAudioSessionCategory.playAndRecord,
         avAudioSessionCategoryOptions:
             as_lib.AVAudioSessionCategoryOptions.allowBluetooth |
                 as_lib.AVAudioSessionCategoryOptions.defaultToSpeaker |
-                as_lib.AVAudioSessionCategoryOptions
-                    .mixWithOthers, // 👈 關鍵：允許混音，不被 YT 中斷
+                as_lib.AVAudioSessionCategoryOptions.mixWithOthers,
         androidAudioAttributes: as_lib.AndroidAudioAttributes(
           contentType: as_lib.AndroidAudioContentType.speech,
           flags: as_lib.AndroidAudioFlags.none,
-          usage: as_lib.AndroidAudioUsage
-              .media, // 💡 修正1：改為 media，避免系統誤以為在講電話而阻擋 YouTube
+          usage: as_lib.AndroidAudioUsage.media,
         ),
         androidWillPauseWhenDucked: false,
       ));
 
-      await session
-          .setActive(true); // 💡 修正3：必須呼叫這行！iOS 才會套用混音，Android 則會默默套用不搶焦點的設定
+      await session.setActive(true);
 
       final dir = await getApplicationDocumentsDirectory();
       final fileName =
           "rec_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}_p$recordingPart.m4a";
       final path = '${dir.path}/$fileName';
 
-      _isSystemInterrupted = false; // 💡 新增：每次手動開始前，重置中斷狀態
-      _deadMicCounter = 0; // 💡 每次手動開始前，重置計數器
+      _isSystemInterrupted = false;
+      _deadMicCounter = 0;
+      _sessionAudioParts = []; // 💡 清空準備多段錄音
 
       await audioRecorder.start(
         const RecordConfig(
@@ -1433,7 +1451,7 @@ class _MainAppShellState extends State<MainAppShell>
           bitRate: 32000,
           sampleRate: 16000,
           numChannels: 1,
-          autoGain: false, // 💡 修正4：關閉自動增益，讓麥克風回歸最純粹的收音模式，不再與喇叭互斥
+          autoGain: false,
           echoCancel: false,
           noiseSuppress: false,
         ),
@@ -1443,43 +1461,28 @@ class _MainAppShellState extends State<MainAppShell>
       stopwatch.reset();
       stopwatch.start();
 
-      // 👇👇👇 將原本的 timer 整個替換成這個 👇👇👇
+      // 👇 1.0.46 修改開始：更換 Timer 以支援「停止盲目重試，等待用戶回歸」邏輯 👇
       timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
         if (!mounted) return;
-
-        if (_isRecovering) return; // 正在嘗試恢復中，跳過此秒
+        if (_isRecovering) return;
 
         bool isStillRecording = await audioRecorder.isRecording();
         bool isMicDead = false;
 
-        // 💡 雙重保險監控：只有在「離開 APP」且「麥克風絕對死寂或凍結」時，才判定被靜音
         if (isStillRecording && !_isSystemInterrupted) {
           try {
             final amp = await audioRecorder.getAmplitude();
             double currentAmp = amp.current;
-
-            // 💡 新增：偵測「凍結」現象 (如果數值完全沒變，代表硬體被拔掉卡死了)
-            if (currentAmp == _lastAmplitude && currentAmp < -30.0) {
+            if (currentAmp == _lastAmplitude && currentAmp < -10.0)
               _frozenMicCounter++;
-            } else {
+            else
               _frozenMicCounter = 0;
-            }
-            _lastAmplitude = currentAmp; // 更新紀錄
-
-            // 💡 傳統的絕對死寂偵測 (保留作為備用)
-            if (currentAmp <= -100.0) {
+            if (currentAmp <= -100.0)
               _deadMicCounter++;
-            } else {
+            else
               _deadMicCounter = 0;
-            }
+            _lastAmplitude = currentAmp;
 
-            // 💡 除錯日誌：加入凍結秒數的顯示
-            if (timer.tick % 2 == 0) {
-              GlobalManager.addLog(
-                  "📊 [監控] 前景: $_isAppInForeground | 分貝: ${currentAmp.toStringAsFixed(2)} dB | 凍結: $_frozenMicCounter 秒 | 死寂: $_deadMicCounter 秒");
-            }
-
-            // 💡 終極觸發條件：連續 3 秒死寂，或者連續 3 秒凍結，且 APP 在背景！
             if ((_deadMicCounter >= 3 || _frozenMicCounter >= 3) &&
                 !_isAppInForeground) {
               isMicDead = true;
@@ -1487,44 +1490,40 @@ class _MainAppShellState extends State<MainAppShell>
           } catch (_) {}
         }
 
-        // 💡 系統中斷觸發區 (真的沒在錄，或者陷入空跑被靜音狀態)
         if ((!isStillRecording || isMicDead) &&
             GlobalManager.isRecordingNotifier.value) {
           if (!_isSystemInterrupted) {
             _isSystemInterrupted = true;
-            _deadMicCounter = 0; // 重置計數器
-            _frozenMicCounter = 0; // 💡 新增：重置凍結計數
-            _lastAmplitude = 0.0; // 💡 新增
+            _deadMicCounter = 0;
+            _frozenMicCounter = 0;
+            _lastAmplitude = 0.0;
             stopwatch.stop();
-            GlobalManager.addLog("⚠️ 偵測到麥克風遭系統強制收回(空跑)，保存進度並進入等待模式...");
 
-            // 💡 智能通知：引導使用者點擊回 APP 恢復
+            GlobalManager.addLog(
+                "⚠️ 錄音被系統奪取！已暫存 Part $recordingPart。等待您點擊 APP 恢復...");
             FlutterForegroundTask.updateService(
-              notificationTitle: '⚠️ 錄音被系統暫停',
-              notificationText: '請點擊回到 APP 即可自動恢復錄音',
+              notificationTitle: '⚠️ 錄音已暫停',
+              notificationText: '請點擊回到 APP 以繼續錄音',
             );
 
             try {
               final path = await audioRecorder.stop();
-              // 如果錄段大於 4 秒才保存 (扣掉剛才偵測空跑的 3 秒)
-              if (path != null && stopwatch.elapsed.inSeconds >= 4) {
-                String title = "會議錄音 Part $recordingPart (被中斷)";
-                createNewNoteAndAnalyze(path, title, date: DateTime.now());
+              if (path != null && stopwatch.elapsed.inSeconds >= 2) {
+                _sessionAudioParts.add(path); // 💡 將片段加入清單
               } else if (path != null) {
                 File(path).delete().catchError((_) {});
               }
-            } catch (e) {
-              GlobalManager.addLog("保存舊檔發生異常: $e");
-            }
+            } catch (e) {}
 
             recordingPart++;
+            _isWaitingForUserResume = true; // 💡 標記為：等待用戶回歸
           } else {
-            // 💡 中斷狀態中：每 3 秒敲門一次
-            if (timer.tick % 3 == 0) {
+            // 💡 只有當用戶回到畫面上時，才嘗試恢復！不再打擾通話或 YT！
+            if (_isAppInForeground && _isWaitingForUserResume) {
               _isRecovering = true;
+              _isWaitingForUserResume = false;
               try {
-                GlobalManager.addLog("🔄 嘗試搶回麥克風權限...");
-
+                GlobalManager.addLog("🔄 歡迎回來！嘗試恢復錄音...");
                 final session = await as_lib.AudioSession.instance;
                 await session.setActive(true);
 
@@ -1535,43 +1534,36 @@ class _MainAppShellState extends State<MainAppShell>
 
                 await audioRecorder.start(
                   const RecordConfig(
-                    encoder: AudioEncoder.aacLc,
-                    bitRate: 32000,
-                    sampleRate: 16000,
-                    numChannels: 1,
-                    autoGain: false,
-                    echoCancel: false,
-                    noiseSuppress: false,
-                  ),
+                      encoder: AudioEncoder.aacLc,
+                      bitRate: 32000,
+                      sampleRate: 16000,
+                      numChannels: 1,
+                      autoGain: false),
                   path: resumePath,
                 );
 
-                // 💡 等待 1 秒驗證是否真的活著且有聲音，不再被騙
                 await Future.delayed(const Duration(seconds: 1));
-                bool alive = await audioRecorder.isRecording();
-                if (alive) {
-                  final amp = await audioRecorder.getAmplitude();
-                  if (amp.current <= -150.0) {
-                    alive = false; // 依然是空跑，視為失敗
-                  }
-                }
-
-                if (alive) {
+                if (await audioRecorder.isRecording()) {
                   _isSystemInterrupted = false;
                   _deadMicCounter = 0;
-                  stopwatch.reset();
+                  _frozenMicCounter = 0;
+                  _lastAmplitude = 0.0;
+
+                  // 💡 不歸零計時器！讓使用者感覺是一場連續的錄音
                   stopwatch.start();
-                  GlobalManager.addLog("✅ 成功恢復錄音 (Part $recordingPart)");
+                  GlobalManager.addLog("✅ 成功接續錄音 (內部 Part $recordingPart)");
 
                   FlutterForegroundTask.updateService(
                     notificationTitle: '會議錄音中',
-                    notificationText: '已自動接續錄製 (Part $recordingPart)',
+                    notificationText: '已恢復錄製 (總計 $timerText)',
                   );
                 } else {
-                  await audioRecorder.stop(); // 搶奪失敗，等下一個 3 秒
+                  await audioRecorder.stop();
+                  GlobalManager.addLog("❌ 恢復失敗，請確認已關閉通話或其他聲音來源。");
+                  _isWaitingForUserResume = true; // 允許下次重試
                 }
               } catch (e) {
-                GlobalManager.addLog("❌ 恢復重試被拒絕");
+                _isWaitingForUserResume = true;
               } finally {
                 _isRecovering = false;
               }
@@ -1580,7 +1572,6 @@ class _MainAppShellState extends State<MainAppShell>
           return;
         }
 
-        // --- 正常狀態 ---
         setState(() {
           timerText =
               "${stopwatch.elapsed.inMinutes.toString().padLeft(2, '0')}:${(stopwatch.elapsed.inSeconds % 60).toString().padLeft(2, '0')}";
@@ -1590,10 +1581,10 @@ class _MainAppShellState extends State<MainAppShell>
           await handleAutoSplit();
         }
       });
-      // 👆👆👆 替換結束 👆👆👆
+      // 👆 1.0.46 修改結束 👆
 
       GlobalManager.isRecordingNotifier.value = true;
-      await WakelockPlus.enable(); // 💡 新增：啟動喚醒鎖，防止手機休眠砍掉麥克風
+      await WakelockPlus.enable();
       GlobalManager.addLog(
           "開始錄音並啟用 Wakelock 防休眠 (32kbps 瘦身模式，確保符合 Groq 大小限制)...");
     } else {
@@ -1615,21 +1606,23 @@ class _MainAppShellState extends State<MainAppShell>
       if (recordingSessionStartTime != null) {
         title += " (${DateFormat('HH:mm').format(recordingSessionStartTime!)})";
       }
-      createNewNoteAndAnalyze(path, title, date: DateTime.now());
+      // 👇 1.0.46 修改開始：改為傳入 List 👇
+      createNewNoteAndAnalyze([path], title, date: DateTime.now());
+      // 👆 1.0.46 修改結束 👆
     }
 
     recordingPart++;
     await startRecording();
   }
 
-  // 👇 修改：完善停止邏輯 👇
+  // 👇 1.0.46 修改開始：收尾多段錄音 👇
   Future<void> stopAndAnalyze({bool manualStop = false}) async {
     timer?.cancel();
 
     String? path;
     try {
       path = await audioRecorder.stop();
-    } catch (_) {} // 忽略可能因為已經停止而產生的錯誤
+    } catch (_) {}
 
     stopwatch.stop();
     GlobalManager.isRecordingNotifier.value = false;
@@ -1639,31 +1632,39 @@ class _MainAppShellState extends State<MainAppShell>
       await FlutterForegroundTask.stopService();
     }
 
-    // 💡 判斷：如果有檔案、且不在中斷死機狀態、且長度超過 2 秒，才儲存分析
     if (path != null &&
         !_isSystemInterrupted &&
         stopwatch.elapsed.inSeconds >= 2) {
+      _sessionAudioParts.add(path); // 💡 加入最後一個片段
+    } else if (path != null && _isSystemInterrupted) {
+      File(path).delete().catchError((_) {});
+    }
+
+    // 💡 只有當有錄到東西時，才開始分析合併
+    if (_sessionAudioParts.isNotEmpty) {
       String title = manualStop && recordingPart == 1
           ? "會議錄音"
-          : "會議錄音 Part $recordingPart";
-      createNewNoteAndAnalyze(path, title, date: DateTime.now());
-    } else if (path != null && _isSystemInterrupted) {
-      // 若在異常期間按下停止，直接清理剛才沒錄成的碎檔
-      File(path).delete().catchError((_) {});
+          : "會議錄音 (${DateFormat('HH:mm').format(recordingSessionStartTime ?? DateTime.now())})";
+      createNewNoteAndAnalyze(List.from(_sessionAudioParts), title,
+          date: DateTime.now());
     }
 
     setState(() {
       timerText = "00:00";
-      _isSystemInterrupted = false; // 恢復預設
+      _isSystemInterrupted = false;
       _isRecovering = false;
-      _deadMicCounter = 0; // 💡 確保停止後歸零
-      _frozenMicCounter = 0; // 💡 新增
-      _lastAmplitude = 0.0; // 💡 新增
+      _isWaitingForUserResume = false;
+      _deadMicCounter = 0;
+      _frozenMicCounter = 0;
+      _lastAmplitude = 0.0;
+      _sessionAudioParts = []; // 清空準備下一次錄音
     });
   }
+  // 👆 1.0.46 修改結束 👆
 
+  // 👇 1.0.46 修改開始：支援接收 List<String> paths 👇
   void createNewNoteAndAnalyze(
-    String path,
+    List<String> paths,
     String defaultTitle, {
     required DateTime date,
   }) async {
@@ -1675,13 +1676,15 @@ class _MainAppShellState extends State<MainAppShell>
       tasks: [],
       transcript: [],
       sections: [],
-      audioPath: path,
+      audioPath: paths.isNotEmpty ? paths.first : "", // 相容舊版
+      audioParts: paths, // 💡 多段音訊來源
       status: NoteStatus.processing,
     );
     await GlobalManager.saveNote(newNote);
     GlobalManager.analyzeNote(newNote);
     if (mounted) setState(() {});
   }
+  // 👆 1.0.46 修改結束 👆
 
   Future<void> pickFile() async {
     Map<Permission, PermissionStatus> statuses = await [
@@ -1729,7 +1732,8 @@ class _MainAppShellState extends State<MainAppShell>
           GlobalManager.addLog("取得檔案時間失敗: $e");
         }
 
-        createNewNoteAndAnalyze(file.path, "匯入錄音", date: fileDate);
+        createNewNoteAndAnalyze([file.path], "匯入錄音",
+            date: fileDate); // 💡 修改：包成 List
       }
     } else {
       if (mounted) {
@@ -1837,6 +1841,7 @@ class _MainAppShellState extends State<MainAppShell>
         }
 
         note.audioPath = audioFile.path;
+        note.audioParts = [audioFile.path]; // 💡 新增多檔支援設定
         note.currentStep = '準備進行分析...';
         await GlobalManager.saveNote(note);
 
@@ -2172,6 +2177,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
 
+  // 👇 1.0.46 修改開始：無縫播放器參數 👇
+  List<double> _partOffsets = [];
+  int _currentPlayingPartIndex = 0;
+  // 👆 1.0.46 修改結束 👆
+
   final ScrollController _transcriptScrollController = ScrollController();
   final Map<int, GlobalKey> _transcriptKeys = {};
   int _currentActiveTranscriptIndex = -1;
@@ -2186,6 +2196,8 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     super.initState();
     _note = widget.note;
     _tabController = TabController(length: 3, vsync: this);
+
+    _initAudioOffsets(); // 💡 初始化各段落長度
 
     if (_note.status == NoteStatus.processing ||
         _note.status == NoteStatus.downloading) {
@@ -2205,17 +2217,25 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     _audioPlayer.onPlayerStateChanged.listen((state) {
       if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
     });
+
     _audioPlayer.onDurationChanged.listen((d) {
-      if (mounted) setState(() => _duration = d);
+      // 由於是拼接的，我們在 _initAudioOffsets 計算總長度，不採用單一檔案的 duration
     });
+
+    // 👇 1.0.46 修改開始：無縫拼接時間軸計算與換軌 👇
     _audioPlayer.onPositionChanged.listen((p) {
       if (mounted) {
-        setState(() => _position = p);
+        double offset = (_partOffsets.isNotEmpty &&
+                _currentPlayingPartIndex < _partOffsets.length)
+            ? _partOffsets[_currentPlayingPartIndex]
+            : 0;
+        double globalSeconds = p.inMilliseconds / 1000.0 + offset;
+        setState(() =>
+            _position = Duration(milliseconds: (globalSeconds * 1000).toInt()));
 
         if (_tabController.index == 1 && _note.transcript.isNotEmpty) {
-          double currentSeconds = p.inMilliseconds / 1000.0;
           int newIndex = _note.transcript
-              .lastIndexWhere((t) => currentSeconds >= t.startTime);
+              .lastIndexWhere((t) => globalSeconds >= t.startTime);
 
           if (newIndex != -1 && newIndex != _currentActiveTranscriptIndex) {
             setState(() {
@@ -2244,7 +2264,51 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         }
       }
     });
+
+    _audioPlayer.onPlayerComplete.listen((_) async {
+      List<String> paths =
+          _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
+      if (_currentPlayingPartIndex < paths.length - 1) {
+        _currentPlayingPartIndex++;
+        File actualFile =
+            await GlobalManager.getActualFile(paths[_currentPlayingPartIndex]);
+        if (await actualFile.exists()) {
+          await _audioPlayer.play(DeviceFileSource(actualFile.path));
+        }
+      } else {
+        if (mounted)
+          setState(() {
+            _isPlaying = false;
+            _position = Duration.zero;
+            _currentPlayingPartIndex = 0;
+          });
+      }
+    });
+    // 👆 1.0.46 修改結束 👆
   }
+
+  // 👇 1.0.46 修改開始：初始化拼接時間點 👇
+  Future<void> _initAudioOffsets() async {
+    List<String> paths =
+        _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
+    double current = 0;
+    for (String p in paths) {
+      if (p.isEmpty) continue;
+      _partOffsets.add(current);
+      File f = await GlobalManager.getActualFile(p);
+      if (await f.exists()) {
+        final tempP = AudioPlayer();
+        await tempP.setSource(DeviceFileSource(f.path));
+        final d = await tempP.getDuration();
+        current += (d?.inMilliseconds ?? 0) / 1000.0;
+        await tempP.dispose();
+      }
+    }
+    if (mounted)
+      setState(
+          () => _duration = Duration(milliseconds: (current * 1000).toInt()));
+  }
+  // 👆 1.0.46 修改結束 👆
 
   Future<void> _reloadNote() async {
     final prefs = await SharedPreferences.getInstance();
@@ -2269,11 +2333,16 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     super.dispose();
   }
 
+  // 👇 1.0.46 修改開始：播放器控制邏輯適配多檔案 👇
   Future<void> _playPause() async {
     if (_isPlaying) {
       await _audioPlayer.pause();
     } else {
-      File actualFile = await GlobalManager.getActualFile(_note.audioPath);
+      List<String> paths =
+          _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
+      if (paths.isEmpty) return;
+      File actualFile =
+          await GlobalManager.getActualFile(paths[_currentPlayingPartIndex]);
       if (await actualFile.exists()) {
         await _audioPlayer.play(DeviceFileSource(actualFile.path));
       } else {
@@ -2284,27 +2353,43 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   }
 
   Future<void> _seekTo(double seconds) async {
-    File actualFile = await GlobalManager.getActualFile(_note.audioPath);
-    if (await actualFile.exists()) {
-      if (_duration == Duration.zero && !_isPlaying) {
-        await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
+    List<String> paths =
+        _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
+    if (paths.isEmpty) return;
+
+    if (paths.length <= 1) {
+      File actualFile = await GlobalManager.getActualFile(paths.first);
+      if (await actualFile.exists()) {
+        if (_duration == Duration.zero && !_isPlaying)
+          await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
+        await _audioPlayer.seek(Duration(seconds: seconds.toInt()));
       }
-      await _audioPlayer.seek(Duration(seconds: seconds.toInt()));
+    } else {
+      int targetPart = 0;
+      for (int i = 0; i < _partOffsets.length; i++) {
+        if (seconds >= _partOffsets[i]) targetPart = i;
+      }
+      double relativeSeconds = seconds - _partOffsets[targetPart];
+      File actualFile = await GlobalManager.getActualFile(paths[targetPart]);
+      if (await actualFile.exists()) {
+        if (_currentPlayingPartIndex != targetPart ||
+            (!_isPlaying && _duration == Duration.zero)) {
+          _currentPlayingPartIndex = targetPart;
+          if (_isPlaying)
+            await _audioPlayer.play(DeviceFileSource(actualFile.path));
+          else
+            await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
+        }
+        await _audioPlayer.seek(Duration(seconds: relativeSeconds.toInt()));
+      }
     }
   }
 
   Future<void> _seekAndPlay(double seconds) async {
-    File actualFile = await GlobalManager.getActualFile(_note.audioPath);
-    if (await actualFile.exists()) {
-      await _audioPlayer.play(DeviceFileSource(actualFile.path));
-      await _audioPlayer.seek(Duration(seconds: seconds.toInt()));
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text("找不到此音檔")));
-      }
-    }
+    await _seekTo(seconds);
+    if (!_isPlaying) await _playPause();
   }
+  // 👆 1.0.46 修改結束 👆
 
   Future<void> _saveNoteUpdate() async {
     await GlobalManager.saveNote(_note);
@@ -2668,7 +2753,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     await _exportFile('md', md.toString());
   }
 
-  // 💡 新增：匯出未經 Gemini 處理的純 STT 原始文字，用於抓蟲
   Future<void> _exportRawSTT() async {
     try {
       StringBuffer raw = StringBuffer();
@@ -2761,14 +2845,23 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   Future<void> _exportAudio() async {
     try {
-      File f = await GlobalManager.getActualFile(_note.audioPath);
-      if (await f.exists()) {
-        await Share.shareXFiles([XFile(f.path)],
-            text: '匯出會議音檔: ${_note.title}');
+      // 👇 1.0.46 修改開始：支援匯出多檔案 👇
+      List<String> paths =
+          _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
+      List<XFile> shareFiles = [];
+      for (var p in paths) {
+        if (p.isEmpty) continue;
+        File f = await GlobalManager.getActualFile(p);
+        if (await f.exists()) shareFiles.add(XFile(f.path));
+      }
+
+      if (shareFiles.isNotEmpty) {
+        await Share.shareXFiles(shareFiles, text: '匯出會議音檔: ${_note.title}');
       } else {
         ScaffoldMessenger.of(context)
             .showSnackBar(const SnackBar(content: Text("找不到實體音檔，可能已被系統清除")));
       }
+      // 👆 1.0.46 修改結束 👆
     } catch (e) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text("音檔匯出失敗: $e")));
@@ -2823,7 +2916,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
-              if (value == 'raw_stt') _exportRawSTT(); // 💡 新增綁定
+              if (value == 'raw_stt') _exportRawSTT();
               if (value == 'audio') _exportAudio();
               if (value == 'delete') _confirmDelete();
             },
@@ -2834,11 +2927,10 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               const PopupMenuItem(
                   value: 'raw_stt',
                   child: Text("匯出 STT 原始聽寫稿 (除錯用)",
-                      style: TextStyle(color: Colors.deepPurple))), // 💡 UI 選項
+                      style: TextStyle(color: Colors.deepPurple))),
               const PopupMenuItem(
                   value: 'audio',
-                  child: Text("匯出原始音檔 (壓縮轉檔用)",
-                      style: TextStyle(color: Colors.blue))),
+                  child: Text("匯出原始音檔", style: TextStyle(color: Colors.blue))),
               const PopupMenuItem(
                   value: 'delete',
                   child: Text("刪除紀錄", style: TextStyle(color: Colors.red))),
@@ -3228,8 +3320,8 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _vocabController = TextEditingController();
   final TextEditingController _participantController = TextEditingController();
 
-  String _analysisStrategy = 'groq_gemini'; // 預設推薦雙引擎
-  String _sttLanguage = 'zh'; // 💡 新增狀態變數
+  String _analysisStrategy = 'groq_gemini';
+  String _sttLanguage = 'zh';
   bool _isLoadingModels = false;
 
   @override
@@ -3244,7 +3336,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _groqKeyController.text = prefs.getString('groq_api_key') ?? '';
       _analysisStrategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
-      _sttLanguage = prefs.getString('stt_language') ?? 'zh'; // 💡 讀取
+      _sttLanguage = prefs.getString('stt_language') ?? 'zh';
     });
   }
 
@@ -3289,7 +3381,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('groq_api_key', _groqKeyController.text);
     await prefs.setString('analysis_strategy', _analysisStrategy);
-    await prefs.setString('stt_language', _sttLanguage); // 💡 寫入
+    await prefs.setString('stt_language', _sttLanguage);
 
     if (mounted) {
       ScaffoldMessenger.of(context)
@@ -3299,18 +3391,14 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
-    // 💡 動態成本計算邏輯
     int daysSinceFirstUse = UsageTracker.firstUseDate == null
         ? 1
         : DateTime.now().difference(UsageTracker.firstUseDate!).inDays;
     if (daysSinceFirstUse < 1) daysSinceFirstUse = 1;
 
-    double groqCost =
-        (UsageTracker.groqAudioSeconds / 3600) * 0.10; // 每小時 0.10 USD
-    double geminiTextCost =
-        UsageTracker.geminiTextRequests * 0.0001125; // 粗估每次請求 1500 tokens
-    double geminiAudioCost =
-        (UsageTracker.geminiAudioSeconds / 60) * 0.0012; // 粗估 Flash 音訊價格
+    double groqCost = (UsageTracker.groqAudioSeconds / 3600) * 0.10;
+    double geminiTextCost = UsageTracker.geminiTextRequests * 0.0001125;
+    double geminiAudioCost = (UsageTracker.geminiAudioSeconds / 60) * 0.0012;
 
     double totalCurrentCost = groqCost + geminiTextCost + geminiAudioCost;
     double projectedMonthlyCost = (totalCurrentCost / daysSinceFirstUse) * 30;
@@ -3377,7 +3465,6 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 20),
-
           const Text(
             "分析模式 (AI 核心策略)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -3419,9 +3506,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 fontSize: 12,
                 color: _analysisStrategy == 'pro' ? Colors.red : Colors.green),
           ),
-
           const SizedBox(height: 20),
-          // 💡 新增：STT 語系選擇下拉選單
           const Text(
             "語音辨識主要語言 (STT Language)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -3458,7 +3543,6 @@ class _SettingsPageState extends State<SettingsPage> {
             "💡 提示：若會議有明確主導語言請明確選擇，可極大化消滅 STT 幻覺。",
             style: TextStyle(fontSize: 12, color: Colors.grey),
           ),
-
           const SizedBox(height: 20),
           Card(
             color: Colors.blue.shade50,
@@ -3516,7 +3600,6 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
           ),
-
           const SizedBox(height: 20),
           const Text(
             "預設與會者 (常用名單)",
