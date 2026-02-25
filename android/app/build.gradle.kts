@@ -6,11 +6,9 @@ plugins {
 }
 
 android {
-    // 關鍵修改 1：namespace 必須對應您的 Kotlin 檔案資料夾結構
-    // 您的 MainActivity 位於 com/example/myapp/MainActivity.kt，所以這裡必須是 myapp
     namespace = "com.example.myapp" 
     
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36 // 👈 修正 1：配合最新套件要求改為 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -23,14 +21,18 @@ android {
     }
 
     defaultConfig {
-        // 關鍵修改 2：applicationId 是您希望 App 在手機/商店顯示的真實 ID
-        // 根據您之前的 Manifest 設定，這裡應該是 meeting_recorder
         applicationId = "com.example.meeting_recorder"
-        
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 36 // 👈 同步升級為 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+    }
+
+    // 👈 修正 2：明確宣告 debug 簽名設定，防止 R8 解析依賴時崩潰
+    signingConfigs {
+        getByName("debug") {
+            // 保留預設行為
+        }
     }
 
     buildTypes {
