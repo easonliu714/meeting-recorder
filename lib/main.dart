@@ -24,7 +24,7 @@ import 'dart:isolate'; // 解決 SendPort 錯誤
 import 'package:wakelock_plus/wakelock_plus.dart'; // 解決 WakelockPlus 錯誤
 import 'package:audio_session/audio_session.dart' as as_lib; // 💡 新增
 
-const String APP_VERSION = "1.0.44"; // 💡 增加分貝值除錯訊息
+const String APP_VERSION = "1.0.45"; // 💡 增加分貝值除錯訊息,分貝值凍結判定
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1307,6 +1307,9 @@ class _MainAppShellState extends State<MainAppShell>
   bool _isSystemInterrupted = false; // 💡 新增：用來追蹤是否正在等待資源釋放
   bool _isRecovering = false;
   int _deadMicCounter = 0; // 💡 新增：用來追蹤連續空跑(絕對靜音)的秒數
+  // 👇 💡 新增：用來追蹤分貝是否「凍結」
+  double _lastAmplitude = 0.0;
+  int _frozenMicCounter = 0;
   // 💡 新增：追蹤 APP 是否在畫面上
   bool _isAppInForeground = true;
 
@@ -1449,25 +1452,36 @@ class _MainAppShellState extends State<MainAppShell>
         bool isStillRecording = await audioRecorder.isRecording();
         bool isMicDead = false;
 
-        // 💡 監控「空跑/被靜音」：檢查麥克風分貝是否為絕對死寂 (<= -150dB)
+        // 💡 雙重保險監控：只有在「離開 APP」且「麥克風絕對死寂或凍結」時，才判定被靜音
         if (isStillRecording && !_isSystemInterrupted) {
           try {
             final amp = await audioRecorder.getAmplitude();
-            // 💡 新增：每 2 秒印出一次除錯資訊，避免洗版，同時保留高解析度監控
-            if (timer.tick % 2 == 0) {
-              GlobalManager.addLog(
-                  "📊 [監控] 前景: $_isAppInForeground | 分貝: ${amp.current.toStringAsFixed(2)} dB | 空跑: $_deadMicCounter 秒");
-            }
+            double currentAmp = amp.current;
 
-            // 💡 調整：我們先將閾值設為 -100.0，後續可依據日誌測出的真實極限值再做微調
-            if (amp.current <= -100.0) {
+            // 💡 新增：偵測「凍結」現象 (如果數值完全沒變，代表硬體被拔掉卡死了)
+            if (currentAmp == _lastAmplitude && currentAmp < -30.0) {
+              _frozenMicCounter++;
+            } else {
+              _frozenMicCounter = 0;
+            }
+            _lastAmplitude = currentAmp; // 更新紀錄
+
+            // 💡 傳統的絕對死寂偵測 (保留作為備用)
+            if (currentAmp <= -100.0) {
               _deadMicCounter++;
             } else {
               _deadMicCounter = 0;
             }
 
-            // 💡 關鍵修改：連續 3 秒死寂 且 APP 在背景，才觸發救援機制！
-            if (_deadMicCounter >= 3 && !_isAppInForeground) {
+            // 💡 除錯日誌：加入凍結秒數的顯示
+            if (timer.tick % 2 == 0) {
+              GlobalManager.addLog(
+                  "📊 [監控] 前景: $_isAppInForeground | 分貝: ${currentAmp.toStringAsFixed(2)} dB | 凍結: $_frozenMicCounter 秒 | 死寂: $_deadMicCounter 秒");
+            }
+
+            // 💡 終極觸發條件：連續 3 秒死寂，或者連續 3 秒凍結，且 APP 在背景！
+            if ((_deadMicCounter >= 3 || _frozenMicCounter >= 3) &&
+                !_isAppInForeground) {
               isMicDead = true;
             }
           } catch (_) {}
@@ -1479,6 +1493,8 @@ class _MainAppShellState extends State<MainAppShell>
           if (!_isSystemInterrupted) {
             _isSystemInterrupted = true;
             _deadMicCounter = 0; // 重置計數器
+            _frozenMicCounter = 0; // 💡 新增：重置凍結計數
+            _lastAmplitude = 0.0; // 💡 新增
             stopwatch.stop();
             GlobalManager.addLog("⚠️ 偵測到麥克風遭系統強制收回(空跑)，保存進度並進入等待模式...");
 
@@ -1641,6 +1657,8 @@ class _MainAppShellState extends State<MainAppShell>
       _isSystemInterrupted = false; // 恢復預設
       _isRecovering = false;
       _deadMicCounter = 0; // 💡 確保停止後歸零
+      _frozenMicCounter = 0; // 💡 新增
+      _lastAmplitude = 0.0; // 💡 新增
     });
   }
 
