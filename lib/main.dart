@@ -19,8 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-const String APP_VERSION =
-    "1.0.34"; // 💡 進版至 1.0.34，修復幻覺與 STT 落地儲存,移除語言鎖定、強化幻覺過濾器
+const String APP_VERSION = "1.0.35"; // 💡 修復 Whisper 靜音幻覺、增加大批次處理與 STT 匯出
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -265,8 +264,8 @@ class GroqApi {
     request.fields['model'] = 'whisper-large-v3';
     request.fields['response_format'] = 'verbose_json';
 
-    // 💡 移除 language 鎖定，開放自動偵測語言以支援跨國/中英夾雜會議
-    // 💡 使用雙語情境 Prompt，將 AI 認知鎖定在會議中，降低 YouTube 廣告幻覺
+    // 💡 核心防禦：Temperature 設為 0，嚴格抑制 Whisper 遇到靜音時的廣告詞幻覺
+    request.fields['temperature'] = '0';
     request.fields['prompt'] = 'Meeting transcription. 會議紀錄。';
 
     request.files
@@ -780,23 +779,23 @@ class GlobalManager {
         if (!useGeminiFallback) {
           if (whisperSegments.isEmpty) throw Exception("音檔無內容或辨識失敗");
 
-          // 💡 修正 2：立即將 Groq 的原始文字存入資料庫 (防止 Gemini 失敗後資料遺失)
           List<TranscriptItem> rawTranscript = whisperSegments.map((seg) {
             return TranscriptItem(
-              speaker: 'System', // 暫時標記為 System
+              speaker: 'System',
               original: seg['text'],
               startTime: (seg['start'] as num).toDouble(),
             );
           }).toList();
 
           note.transcript = rawTranscript;
-          await saveNote(note); // 👈 存檔落地，保住 STT 心血！
+          await saveNote(note);
 
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
 
           int totalSegments = whisperSegments.length;
-          int batchSize = 40;
+          // 💡 核心優化：將批次大幅拉高到 150 句，最大化降低 API 呼叫次數
+          int batchSize = 150;
           int totalBatches = (totalSegments / batchSize).ceil();
           int chunkCount = 0;
 
@@ -1038,7 +1037,7 @@ class GlobalManager {
       List<TranscriptItem> calibratedTranscript = [];
 
       int totalItems = note.transcript.length;
-      int batchSize = 40;
+      int batchSize = 150;
       int totalBatches = (totalItems / batchSize).ceil();
 
       for (int i = 0; i < totalBatches; i++) {
@@ -2360,6 +2359,28 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     await _exportFile('md', md.toString());
   }
 
+  // 💡 新增：匯出未經 Gemini 處理的純 STT 原始文字，用於抓蟲
+  Future<void> _exportRawSTT() async {
+    try {
+      StringBuffer raw = StringBuffer();
+      raw.writeln("【Groq STT 原始聽寫稿 (除錯用)】");
+      raw.writeln("會議標題: ${_note.title}\n");
+      for (var item in _note.transcript) {
+        raw.writeln("[${item.startTime}s] ${item.original}");
+      }
+
+      final dir = await getApplicationDocumentsDirectory();
+      final safeTitle = _note.title.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+      final file = File('${dir.path}/${safeTitle}_raw_stt.txt');
+      await file.writeAsString(raw.toString());
+
+      await Share.shareXFiles([XFile(file.path)], text: '匯出原始 STT 聽寫稿');
+    } catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("匯出失敗: $e")));
+    }
+  }
+
   Future<void> _generatePdf() async {
     final pdf = pw.Document();
     final fontRegular = await PdfGoogleFonts.notoSansTCRegular();
@@ -2493,6 +2514,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
+              if (value == 'raw_stt') _exportRawSTT(); // 💡 新增綁定
               if (value == 'audio') _exportAudio();
               if (value == 'delete') _confirmDelete();
             },
@@ -2500,6 +2522,10 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               const PopupMenuItem(value: 'pdf', child: Text("匯出 PDF")),
               const PopupMenuItem(value: 'csv', child: Text("匯出 Excel (CSV)")),
               const PopupMenuItem(value: 'md', child: Text("匯出 Markdown")),
+              const PopupMenuItem(
+                  value: 'raw_stt',
+                  child: Text("匯出 STT 原始聽寫稿 (除錯用)",
+                      style: TextStyle(color: Colors.deepPurple))), // 💡 UI 選項
               const PopupMenuItem(
                   value: 'audio',
                   child: Text("匯出原始音檔 (壓縮轉檔用)",
