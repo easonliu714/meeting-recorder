@@ -23,7 +23,7 @@ import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
-const String APP_VERSION = "1.0.49"; // 💡 取消GROQ上傳失敗使用原生檔案上拋GEMINI
+const String APP_VERSION = "1.0.50"; // 💡 GEMINI先摘要再逐字稿，重新校正錯字與講者
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -256,9 +256,7 @@ class UsageTracker {
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     String? dateStr = prefs.getString('usage_first_date');
-    if (dateStr != null) {
-      firstUseDate = DateTime.tryParse(dateStr);
-    }
+    firstUseDate = DateTime.tryParse(dateStr!);
     if (firstUseDate == null) {
       firstUseDate = DateTime.now();
       await prefs.setString(
@@ -325,10 +323,11 @@ class GroqApi {
     int retries = 3; // 💡 新增：允許網路瞬斷重試 3 次
     while (retries > 0) {
       try {
-        if (retries == 3)
+        if (retries == 3) {
           _log("啟動 Groq 引擎 (語系: $sttLanguage)...");
-        else
+        } else {
           _log("⚠️ 網路不穩，正在重新嘗試上傳至 Groq (剩餘 $retries 次)...");
+        }
 
         var request = http.MultipartRequest('POST',
             Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
@@ -832,12 +831,14 @@ class GlobalManager {
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
 
-      // 👇 替換這個區塊 👇
       List<String> targetParts =
           note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
       double globalOffsetSeconds = 0.0;
       List<dynamic> allWhisperSegments = [];
 
+      // ==========================================
+      // 🥇 雙引擎模式 (Groq -> 全局摘要 -> 局部淨化)
+      // ==========================================
       if (strategy == 'groq_gemini') {
         if (groqKey.isEmpty) throw Exception("未設定 Groq API Key，請至設定頁面輸入");
 
@@ -851,7 +852,6 @@ class GlobalManager {
           await tempPlayer.dispose();
           double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
 
-          // 💡 修正：超過 25MB 不再偷轉給 Gemini，直接阻擋以保護額度
           if (partFile.lengthSync() / (1024 * 1024) >= 25.0) {
             throw Exception("單一音檔超過 25MB 限制，Groq 無法處理。");
           }
@@ -868,53 +868,111 @@ class GlobalManager {
               allWhisperSegments.add(seg);
             }
           } catch (e) {
-            // 💡 修正：Groq 失敗不再自動切換備案，直接拋出錯誤讓使用者處理
             throw Exception("Groq 引擎處理失敗: $e");
           }
           globalOffsetSeconds += partSecs;
         }
 
         if (allWhisperSegments.isNotEmpty) {
-          // 彙整所有段落的原始逐字稿
+          // 儲存原始逐字稿備底
           List<TranscriptItem> rawTranscript = allWhisperSegments.map((seg) {
             return TranscriptItem(
               speaker: 'System',
               original: seg['text'],
-              startTime: seg['start'], // 已經是偏移過的時間！
+              startTime: seg['start'],
             );
           }).toList();
           note.transcript = rawTranscript;
           await saveNote(note);
 
+          // 👇 階段一：生成全局摘要 (採納您的絕佳建議) 👇
+          note.currentStep = "Gemini 全局摘要生成中...";
+          await saveNote(note);
+
+          StringBuffer fullRawText = StringBuffer();
+          for (var seg in allWhisperSegments) {
+            fullRawText.writeln("[${seg['start']}秒] ${seg['text']}");
+          }
+
+          String summaryPrompt = """
+          這是一份由外部語音辨識系統轉錄的會議原始逐字稿（可能包含錯字、環境雜音或外語幻覺）：
+          ---
+          $fullRawText
+          ---
+          請根據上述內容，整理出這場會議的「全局重點」。
+          專有詞彙庫：${vocabList.join(', ')}。預設與會者名單：${participantList.join(', ')}。
+
+          請回傳純 JSON 格式，必須包含:
+          - title: 會議標題 (字串)
+          - summary: 重點摘要 (字串陣列)
+          - tasks: 待辦事項 (陣列，包含 description, assignee, dueDate)
+          - sections: 會議段落 (陣列，包含 title, startTime, endTime，時間請用純數字秒數)
+          """;
+
+          try {
+            final summaryResponse = await GeminiRestApi.generateTextOnly(
+                apiKeys, modelsToTry, summaryPrompt, onWait: (msg) async {
+              note.currentStep = "全局摘要生成中 - $msg";
+              await saveNote(note);
+            });
+            final overviewJson = _parseJson(summaryResponse);
+
+            note.title = overviewJson['title']?.toString() ?? note.title;
+            var rawSummary = overviewJson['summary'];
+            note.summary = rawSummary is List
+                ? rawSummary.map((e) => e.toString()).toList()
+                : ["摘要生成失敗"];
+            note.tasks = (overviewJson['tasks'] as List<dynamic>?)
+                    ?.map((e) => TaskItem.fromJson(e))
+                    .toList() ??
+                [];
+            note.sections = (overviewJson['sections'] as List<dynamic>?)
+                    ?.map((e) => Section.fromJson(e))
+                    .toList() ??
+                [];
+            await saveNote(note);
+            _log("✅ 全局摘要生成成功，準備進入上下文淨化。");
+          } catch (e) {
+            _log("⚠️ 全局摘要生成失敗: $e");
+            note.summary = ["基於原始逐字稿摘要失敗，將在淨化後重試。"];
+          }
+
+          // 👇 階段二：帶入「全局上下文」進行講者辨識與幻覺清除 👇
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
-          // --- 替換這個 for 迴圈區塊 ---
           int batchSize = 150;
           int totalBatches = (allWhisperSegments.length / batchSize).ceil();
           int chunkCount = 0;
-          List<dynamic> currentBatchSegments = []; // 💡 新增：用來備份這回合的原始資料
+          List<dynamic> currentBatchSegments = [];
+
+          // 提取剛剛產生的摘要作為上下文背景
+          String contextInfo = note.summary.join('; ');
 
           for (var i = 0; i < allWhisperSegments.length; i++) {
             var seg = allWhisperSegments[i];
             currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
-            currentBatchSegments.add(seg); // 💡 存入備份
+            currentBatchSegments.add(seg);
 
             if ((i + 1) % batchSize == 0 ||
                 i == allWhisperSegments.length - 1) {
               chunkCount++;
-              note.currentStep = "Gemini 講者辨識 ($chunkCount/$totalBatches)...";
+              note.currentStep =
+                  "Gemini 講者辨識與淨化 ($chunkCount/$totalBatches)...";
               await saveNote(note);
 
-              // 💡 強化 Prompt：要求硬性分類講者與清除贅詞
               String textPrompt = """
-              以下是外部 STT 引擎產生的純文字逐字稿（帶有精準時間戳）：
+              這是一場會議的局部逐字稿。
+              【會議全局上下文】：$contextInfo
+              專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
+
+              以下是外部 STT 引擎產生的純文字片段（帶有精準時間戳）：
               ---
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【刪除幻覺與贅詞】：刪除「請精準聽寫內容」等重複指令。強力過濾無意義的口語贅詞(如：那個、就是、然後)及環境雜音，若整句皆無實質內容請直接刪除(回傳[])。
-              2. 【強制字典修正】：參考專有詞彙庫：${vocabList.join(', ')}。找出發音相近的錯字並強制修正。
-              3. 【講者辨識】：參考與會者名單：${participantList.join(', ')}。若名單外有其他人發言，【請務必依據對話邏輯標註為「講者A」、「講者B」等】，絕對不可將不同人的對話全部歸類給同一人！
+              1. 【刪除幻覺與雜音】：強力過濾無意義的口語贅詞。Groq STT 常在無聲處產生「亂碼外語」或「版權宣告」幻覺(如突然出現英文)，若發現與「會議全局上下文」毫不相干的無意義句子，請【直接刪除】(回傳[])！
+              2. 【強制字典修正】：參考專有詞彙庫與上下文，修正發音相近的錯字。
+              3. 【講者辨識】：請根據「上下文邏輯」，精準標註講者（如「講者A」、「講者B」或真實人名）。絕對不可將不同人的對話全部歸類給同一人！
               4. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
               
               回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
@@ -923,7 +981,7 @@ class GlobalManager {
               try {
                 final chunkResponse = await GeminiRestApi.generateTextOnly(
                     apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
-                  note.currentStep = "講者辨識 ($chunkCount/$totalBatches) - $msg";
+                  note.currentStep = "講者淨化 ($chunkCount/$totalBatches) - $msg";
                   await saveNote(note);
                 });
 
@@ -936,31 +994,32 @@ class GlobalManager {
                   throw Exception("回傳了空陣列");
                 }
               } catch (e) {
-                // 💡 致命錯誤救援：如果 Gemini 爆了(額度滿或解析錯)，絕對不能丟棄資料！直接把 Groq 原始文字塞進去
-                _log("⚠️ 講者辨識失敗，啟動資料保留機制(保留原始聽寫): $e");
+                _log("⚠️ 第 $chunkCount 批次講者辨識失敗，保留原始聽寫: $e");
                 fullTranscript.addAll(currentBatchSegments
                     .map((s) => TranscriptItem(
-                        speaker: 'System', // 標為 System 表示未經 AI 分辨
+                        speaker: 'System',
                         original: s['text'],
                         startTime: s['start']))
                     .toList());
               }
               currentChunk.clear();
-              currentBatchSegments.clear(); // 💡 清空備份，準備下一回合
+              currentBatchSegments.clear();
             }
           }
           if (fullTranscript.isNotEmpty) {
             note.transcript = fullTranscript;
           }
 
-          note.currentStep = "最終摘要生成中...";
+          note.status = NoteStatus.success;
+          note.currentStep = '';
           await saveNote(note);
-          await reSummarizeFromTranscript(note);
           return;
         }
       }
 
-      // --- Gemini 原生語音處理模式  ---
+      // ==========================================
+      // 🥈 原生語音處理模式 (純 Gemini 備案)
+      // ==========================================
       if (strategy != 'groq_gemini') {
         modelsToTry = strategy == 'pro'
             ? ['gemini-pro-latest', 'gemini-2.5-pro']
@@ -1144,6 +1203,9 @@ class GlobalManager {
       int batchSize = 150;
       int totalBatches = (totalItems / batchSize).ceil();
 
+      // 👇 帶入全局上下文 👇
+      String contextInfo = note.summary.join('; ');
+
       for (int i = 0; i < totalBatches; i++) {
         int startIdx = i * batchSize;
         int endIdx = min((i + 1) * batchSize, totalItems);
@@ -1159,17 +1221,17 @@ class GlobalManager {
         }
 
         String textPrompt = """
+        這是一場會議的局部逐字稿。
+        【會議全局上下文】：$contextInfo
+        
         以下是現有的逐字稿（帶有精準時間戳）：
         ---
         $currentChunk
         ---
         請扮演極度嚴格的「會議記錄淨化員」，執行以下「校正」任務：
-        1. 【終極幻覺過濾】：請掃描並直接「整句刪除」以下 STT 幻覺垃圾訊息，絕對不要回傳：
-           - 任何包含訂閱、按讚、轉發、打賞等 YouTube 廣告詞。
-           - 無意義的連續重複單字 (如 you you you)。
-           - 字幕組或版權宣告。
+        1. 【終極幻覺過濾】：請掃描並直接「整句刪除」STT 幻覺垃圾訊息。若發現與「會議全局上下文」毫不相干的外語亂碼或無意義疊字，請直接捨棄該句！
         2. 參考最新專有詞彙庫：${vocabList.join(', ')}。修正錯字。
-        3. 參考最新與會者名單：${participantList.join(', ')}。重新精準判斷說話者是誰。
+        3. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意，重新精準判斷說話者是誰。
         4. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
         
         請回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。若全段皆為幻覺，回傳 []。
