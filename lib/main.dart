@@ -24,7 +24,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
 // 👇 1.0.46 修改開始：更新版本號 👇
-const String APP_VERSION = "1.0.46"; // 💡 支援多段錄音合併與背景暫停接續
+const String APP_VERSION = "1.0.48"; // 💡 STT解析增益
 // 👆 1.0.46 修改結束 👆
 
 void main() async {
@@ -291,8 +291,15 @@ class UsageTracker {
 }
 
 class GroqApi {
-  static Future<List<dynamic>> transcribeAudio(String apiKey, File audioFile,
-      double audioDurationSeconds, String sttLanguage) async {
+  // 💡 新增傳入 vocabList 和 participantList
+  static Future<List<dynamic>> transcribeAudio(
+      String apiKey,
+      File audioFile,
+      double audioDurationSeconds,
+      String sttLanguage,
+      List<String> vocabList) async {
+    // 💡 移除了 participantList
+
     _log("啟動 Groq Whisper V3 引擎進行高精度 STT (語系: $sttLanguage)...");
     var request = http.MultipartRequest('POST',
         Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
@@ -306,24 +313,31 @@ class GroqApi {
       request.fields['language'] = sttLanguage;
     }
 
+    // 💡 修正：只給專有名詞，絕對不給人名，避免 Whisper 憑空捏造對話！
+    String contextPrefix = "";
+    if (vocabList.isNotEmpty) {
+      contextPrefix += "專有名詞：${vocabList.join(', ')}。";
+    }
+
     switch (sttLanguage) {
       case 'zh':
-        request.fields['prompt'] = '這是一段真實的會議錄音，請精準聽寫內容。';
+        request.fields['prompt'] = '$contextPrefix這是一段真實的會議錄音，請精準聽寫內容。';
         break;
       case 'en':
         request.fields['prompt'] =
-            'This is a real meeting recording, please transcribe accurately.';
+            '$contextPrefix This is a real meeting recording, please transcribe accurately.';
         break;
       case 'ja':
-        request.fields['prompt'] = 'これは実際の会議の録音です。正確に文字起こししてください。';
+        request.fields['prompt'] =
+            '$contextPrefixこれは実際の会議の録音です。正確に文字起こししてください。';
         break;
       case 'ko':
-        request.fields['prompt'] = '실제 회의 녹음입니다. 정확하게 기록해 주세요.';
+        request.fields['prompt'] = '$contextPrefix실제 회의 녹음입니다. 정확하게 기록해 주세요.';
         break;
       case 'auto':
       default:
         request.fields['prompt'] =
-            'Meeting transcription. 會議紀錄。会議の文字起こし。회의 기록.';
+            '${contextPrefix}Meeting transcription. 會議紀錄。会議の文字起こし。회의 기록.';
         break;
     }
 
@@ -831,8 +845,9 @@ class GlobalManager {
           await saveNote(note);
 
           try {
+            // 💡 1.0.47 修改：將字典傳給 Groq，讓它從源頭就聽懂專有名詞
             var segments = await GroqApi.transcribeAudio(
-                groqKey, partFile, partSecs, sttLanguage);
+                groqKey, partFile, partSecs, sttLanguage, vocabList);
             for (var seg in segments) {
               // 💡 核心拼接魔法：把每段的時間加上上一段的總長度
               seg['start'] =
@@ -1451,9 +1466,9 @@ class _MainAppShellState extends State<MainAppShell>
           bitRate: 32000,
           sampleRate: 16000,
           numChannels: 1,
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
+          autoGain: true, // 💡 解封印！開啟硬體音量自動增益 (遠處人聲自動放大)
+          echoCancel: true, // 💡 1.0.47 啟用防回音
+          noiseSuppress: true, // 💡 1.0.47 啟用環境降噪
         ),
         path: path,
       );
@@ -1473,14 +1488,16 @@ class _MainAppShellState extends State<MainAppShell>
           try {
             final amp = await audioRecorder.getAmplitude();
             double currentAmp = amp.current;
-            if (currentAmp == _lastAmplitude && currentAmp < -10.0)
+            if (currentAmp == _lastAmplitude && currentAmp < -10.0) {
               _frozenMicCounter++;
-            else
+            } else {
               _frozenMicCounter = 0;
-            if (currentAmp <= -100.0)
+            }
+            if (currentAmp <= -100.0) {
               _deadMicCounter++;
-            else
+            } else {
               _deadMicCounter = 0;
+            }
             _lastAmplitude = currentAmp;
 
             if ((_deadMicCounter >= 3 || _frozenMicCounter >= 3) &&
@@ -1534,11 +1551,14 @@ class _MainAppShellState extends State<MainAppShell>
 
                 await audioRecorder.start(
                   const RecordConfig(
-                      encoder: AudioEncoder.aacLc,
-                      bitRate: 32000,
-                      sampleRate: 16000,
-                      numChannels: 1,
-                      autoGain: false),
+                    encoder: AudioEncoder.aacLc,
+                    bitRate: 32000,
+                    sampleRate: 16000,
+                    numChannels: 1,
+                    autoGain: true, // 💡 解封印！開啟硬體音量自動增益 (遠處人聲自動放大)
+                    echoCancel: true, // 💡 開啟硬體防回音
+                    noiseSuppress: true, // 💡 開啟硬體底噪抑制
+                  ),
                   path: resumePath,
                 );
 
@@ -2178,7 +2198,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   Duration _position = Duration.zero;
 
   // 👇 1.0.46 修改開始：無縫播放器參數 👇
-  List<double> _partOffsets = [];
+  final List<double> _partOffsets = [];
   int _currentPlayingPartIndex = 0;
   // 👆 1.0.46 修改結束 👆
 
@@ -2276,12 +2296,13 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           await _audioPlayer.play(DeviceFileSource(actualFile.path));
         }
       } else {
-        if (mounted)
+        if (mounted) {
           setState(() {
             _isPlaying = false;
             _position = Duration.zero;
             _currentPlayingPartIndex = 0;
           });
+        }
       }
     });
     // 👆 1.0.46 修改結束 👆
@@ -2304,9 +2325,10 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         await tempP.dispose();
       }
     }
-    if (mounted)
+    if (mounted) {
       setState(
           () => _duration = Duration(milliseconds: (current * 1000).toInt()));
+    }
   }
   // 👆 1.0.46 修改結束 👆
 
@@ -2360,8 +2382,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     if (paths.length <= 1) {
       File actualFile = await GlobalManager.getActualFile(paths.first);
       if (await actualFile.exists()) {
-        if (_duration == Duration.zero && !_isPlaying)
+        if (_duration == Duration.zero && !_isPlaying) {
           await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
+        }
         await _audioPlayer.seek(Duration(seconds: seconds.toInt()));
       }
     } else {
@@ -2375,10 +2398,11 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         if (_currentPlayingPartIndex != targetPart ||
             (!_isPlaying && _duration == Duration.zero)) {
           _currentPlayingPartIndex = targetPart;
-          if (_isPlaying)
+          if (_isPlaying) {
             await _audioPlayer.play(DeviceFileSource(actualFile.path));
-          else
+          } else {
             await _audioPlayer.setSource(DeviceFileSource(actualFile.path));
+          }
         }
         await _audioPlayer.seek(Duration(seconds: relativeSeconds.toInt()));
       }
