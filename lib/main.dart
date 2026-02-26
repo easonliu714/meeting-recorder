@@ -23,7 +23,7 @@ import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
-const String APP_VERSION = "1.0.51"; // 💡 新增STT引擎Deepgram Nova-2模型
+const String APP_VERSION = "1.0.52"; // 💡 優化STT引擎Deepgram 提示與Gemini任務提示
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -216,7 +216,7 @@ class MeetingNote {
           (json['audioPath'] != null && json['audioPath'].toString().isNotEmpty
               ? [json['audioPath']]
               : []),
-      // 👆 1.0.46 修改結束 👆
+
       summary: List<String>.from(json['summary'] ?? []),
       tasks: (json['tasks'] as List<dynamic>?)
               ?.map((e) => TaskItem.fromJson(e))
@@ -250,6 +250,7 @@ String _maskKey(String key) {
 class UsageTracker {
   static DateTime? firstUseDate;
   static double groqAudioSeconds = 0;
+  static double deepgramAudioSeconds = 0; // 💡 新增 Deepgram 追蹤
   static int geminiTextRequests = 0;
   static double geminiAudioSeconds = 0;
 
@@ -268,6 +269,8 @@ class UsageTracker {
           'usage_first_date', firstUseDate!.toIso8601String());
     }
     groqAudioSeconds = prefs.getDouble('usage_groq_seconds') ?? 0;
+    deepgramAudioSeconds =
+        prefs.getDouble('usage_deepgram_seconds') ?? 0; // 💡 讀取 Deepgram
     geminiTextRequests = prefs.getInt('usage_gemini_texts') ?? 0;
     geminiAudioSeconds = prefs.getDouble('usage_gemini_audio_seconds') ?? 0;
   }
@@ -276,6 +279,13 @@ class UsageTracker {
     groqAudioSeconds += seconds;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('usage_groq_seconds', groqAudioSeconds);
+  }
+
+  static Future<void> addDeepgramSeconds(double seconds) async {
+    // 💡 儲存 Deepgram
+    deepgramAudioSeconds += seconds;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('usage_deepgram_seconds', deepgramAudioSeconds);
   }
 
   static Future<void> addGeminiTextRequest() async {
@@ -381,12 +391,14 @@ class GroqApi {
 }
 
 class DeepgramApi {
-  static Future<List<dynamic>> transcribeAudio(
-      String apiKey, File audioFile, String sttLanguage) async {
-    // Deepgram 語系對應
+  // 💡 新增傳入 vocabList
+  static Future<List<dynamic>> transcribeAudio(String apiKey, File audioFile,
+      String sttLanguage, List<String> vocabList) async {
     String langParam = sttLanguage == 'zh' ? 'zh-TW' : sttLanguage;
+
+    // 💡 明確開啟 punctuate，確保斷句合理
     String urlStr =
-        'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true';
+        'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true&punctuate=true';
 
     if (langParam == 'auto') {
       urlStr += '&detect_language=true';
@@ -394,10 +406,17 @@ class DeepgramApi {
       urlStr += '&language=$langParam';
     }
 
+    // 💡 將專有名詞庫掛接到 Deepgram，並賦予權重 2 (強制辨識)
+    for (String word in vocabList) {
+      if (word.trim().isNotEmpty) {
+        urlStr += '&keywords=${Uri.encodeComponent(word.trim())}:2';
+      }
+    }
+
     var request = http.Request('POST', Uri.parse(urlStr));
     request.headers.addAll({
       'Authorization': 'Token $apiKey',
-      'Content-Type': 'audio/mp4', // Deepgram 會自動解析音檔格式
+      'Content-Type': 'audio/mp4',
     });
 
     request.bodyBytes = await audioFile.readAsBytes();
@@ -408,7 +427,6 @@ class DeepgramApi {
 
     if (response.statusCode == 200 || response.statusCode == 201) {
       var json = jsonDecode(responseBody);
-      // utterances 陣列內含精準的講者分段 (speaker 0, speaker 1...)
       return json['results']?['utterances'] ?? [];
     } else {
       throw Exception(
@@ -923,7 +941,9 @@ class GlobalManager {
           try {
             if (isDeepgram) {
               var utterances = await DeepgramApi.transcribeAudio(
-                  externalKey, partFile, sttLanguage);
+                  externalKey, partFile, sttLanguage, vocabList); // 💡 傳入字典
+              await UsageTracker.addDeepgramSeconds(
+                  partSecs); // 💡 記錄 Deepgram 成本
               for (var u in utterances) {
                 allWhisperSegments.add({
                   'start': (u['start'] as num).toDouble() + globalOffsetSeconds,
@@ -978,7 +998,7 @@ class GlobalManager {
           【極度重要輸出限制】：
           為了避免 JSON 格式過長損毀，請務必精簡：
           1. summary (重點摘要): 請條列 5 到 8 點最重要的決議或討論精華即可。
-          2. tasks (待辦事項): 僅列出明確有指派人的行動項目。
+          2. tasks (待辦事項): 請仔細提取會議中提到的所有「後續行動」、「待處理事項」、「指派任務」或「未來規劃」。若無明確負責人，請填寫「未定」。請盡量列出所有相關任務，絕對不要回傳空的任務清單！
 
           請直接回傳純 JSON 格式，必須包含: title, summary(字串陣列), tasks(陣列), sections(陣列，startTime與endTime使用純數字秒數)。
           不要加上 ```json 標籤，直接以 { 開始。
@@ -1395,7 +1415,7 @@ class GlobalManager {
       請根據上方文字，重新整理會議摘要與任務。
       【嚴格限制】：
       1. 內容必須 100% 來自上方文字，絕對禁止腦補任何未在逐字稿中出現的「人名」或「事項」！
-      2. 待辦事項如果沒有明確負責人，請填寫「未定」。
+      2. 待辦事項 (tasks)：請仔細提取會議中提到的所有「後續行動」、「待處理事項」或「未來規劃」。如果沒有明確負責人，請填寫「未定」。只要有提到未來要處理的事情，請務必列出，絕對不要回傳空的清單。
       3. sections 的 startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
       
       請回傳包含 title, summary, tasks, sections 的純 JSON 格式。
@@ -1644,6 +1664,7 @@ class _MainAppShellState extends State<MainAppShell>
 
       stopwatch.reset();
       stopwatch.start();
+      GlobalManager.addLog("🎙️ 開始錄音 (Part $recordingPart)...");
 
       // 👇 1.0.46 修改開始：更換 Timer 以支援「停止盲目重試，等待用戶回歸」邏輯 👇
       timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
@@ -1875,6 +1896,7 @@ class _MainAppShellState extends State<MainAppShell>
     );
     await GlobalManager.saveNote(newNote);
     GlobalManager.analyzeNote(newNote);
+    GlobalManager.addLog("🛑 結束並儲存錄音...");
     if (mounted) setState(() {});
   }
   // 👆 1.0.46 修改結束 👆
@@ -2629,6 +2651,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               onPressed: () => Navigator.pop(context), child: const Text("取消")),
           TextButton(
             onPressed: () {
+              GlobalManager.addLog("啟動重新分析: [僅重整摘要]"); // 💡 新增
               Navigator.pop(context);
               setState(() {
                 _note.status = NoteStatus.processing;
@@ -2642,6 +2665,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           ),
           TextButton(
             onPressed: () {
+              GlobalManager.addLog("啟動重新分析: [校正錯字與講者]"); // 💡 新增
               Navigator.pop(context);
               setState(() {
                 _note.status = NoteStatus.processing;
@@ -2655,6 +2679,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
           ),
           TextButton(
             onPressed: () {
+              GlobalManager.addLog("啟動重新分析: [徹底語音重聽]"); // 💡 新增
               Navigator.pop(context);
               setState(() {
                 _note.status = NoteStatus.processing;
@@ -2952,11 +2977,18 @@ class _NoteDetailPageState extends State<NoteDetailPage>
 
   Future<void> _exportRawSTT() async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final String strategy =
+          prefs.getString('analysis_strategy') ?? 'deepgram_gemini';
+      final String engineName =
+          strategy.contains('deepgram') ? 'Deepgram' : 'Groq';
+
       StringBuffer raw = StringBuffer();
-      raw.writeln("【Groq STT 原始聽寫稿 (除錯用)】");
+      raw.writeln("【$engineName STT 原始聽寫稿 (除錯用)】"); // 💡 動態代入引擎名稱
       raw.writeln("會議標題: ${_note.title}\n");
       for (var item in _note.transcript) {
-        raw.writeln("[${item.startTime}s] ${item.original}");
+        raw.writeln(
+            "[${item.startTime}s] ${item.speaker}: ${item.original}"); // 💡 加入講者標籤
       }
 
       final dir = await getApplicationDocumentsDirectory();
@@ -3633,10 +3665,14 @@ class _SettingsPageState extends State<SettingsPage> {
     if (daysSinceFirstUse < 1) daysSinceFirstUse = 1;
 
     double groqCost = (UsageTracker.groqAudioSeconds / 3600) * 0.10;
+    double deepgramCost =
+        (UsageTracker.deepgramAudioSeconds / 60) * 0.0043; // 💡 每分鐘 0.0043 USD
     double geminiTextCost = UsageTracker.geminiTextRequests * 0.0001125;
     double geminiAudioCost = (UsageTracker.geminiAudioSeconds / 60) * 0.0012;
 
-    double totalCurrentCost = groqCost + geminiTextCost + geminiAudioCost;
+    // 💡 總成本計入 Deepgram
+    double totalCurrentCost =
+        groqCost + deepgramCost + geminiTextCost + geminiAudioCost;
     double projectedMonthlyCost = (totalCurrentCost / daysSinceFirstUse) * 30;
 
     return Scaffold(
@@ -3784,6 +3820,10 @@ class _SettingsPageState extends State<SettingsPage> {
                     ],
                   ),
                   const SizedBox(height: 12),
+                  Text(
+                      "🎙️ Deepgram STT 音訊: ${(UsageTracker.deepgramAudioSeconds / 3600).toStringAsFixed(2)} 小時",
+                      style:
+                          const TextStyle(fontSize: 13)), // 💡 新增 Deepgram 顯示
                   Text(
                       "🎙️ Groq STT 音訊: ${(UsageTracker.groqAudioSeconds / 3600).toStringAsFixed(2)} 小時",
                       style: const TextStyle(fontSize: 13)),
