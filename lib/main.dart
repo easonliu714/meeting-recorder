@@ -23,7 +23,7 @@ import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
-const String APP_VERSION = "1.0.52"; // 💡 優化STT引擎Deepgram 提示與Gemini任務提示
+const String APP_VERSION = "1.0.53"; // 💡 修正全局摘要問題
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -391,12 +391,12 @@ class GroqApi {
 }
 
 class DeepgramApi {
-  // 💡 新增傳入 vocabList
-  static Future<List<dynamic>> transcribeAudio(String apiKey, File audioFile,
-      String sttLanguage, List<String> vocabList) async {
+  // 💡 移除了 vocabList 參數，讓 STT 回歸純淨語音辨識
+  static Future<List<dynamic>> transcribeAudio(
+      String apiKey, File audioFile, String sttLanguage) async {
     String langParam = sttLanguage == 'zh' ? 'zh-TW' : sttLanguage;
 
-    // 💡 明確開啟 punctuate，確保斷句合理
+    // 💡 保留 punctuate 讓斷句更自然，移除 keywords 參數避免幻覺硬塞
     String urlStr =
         'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true&punctuate=true';
 
@@ -404,13 +404,6 @@ class DeepgramApi {
       urlStr += '&detect_language=true';
     } else {
       urlStr += '&language=$langParam';
-    }
-
-    // 💡 將專有名詞庫掛接到 Deepgram，並賦予權重 2 (強制辨識)
-    for (String word in vocabList) {
-      if (word.trim().isNotEmpty) {
-        urlStr += '&keywords=${Uri.encodeComponent(word.trim())}:2';
-      }
     }
 
     var request = http.Request('POST', Uri.parse(urlStr));
@@ -886,6 +879,7 @@ class GlobalManager {
   static Future<void> analyzeNote(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.currentStep = "準備讀取音檔...";
+    _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
@@ -941,7 +935,7 @@ class GlobalManager {
           try {
             if (isDeepgram) {
               var utterances = await DeepgramApi.transcribeAudio(
-                  externalKey, partFile, sttLanguage, vocabList); // 💡 傳入字典
+                  externalKey, partFile, sttLanguage);
               await UsageTracker.addDeepgramSeconds(
                   partSecs); // 💡 記錄 Deepgram 成本
               for (var u in utterances) {
@@ -979,6 +973,7 @@ class GlobalManager {
 
           // 👇 階段一：生成全局摘要 (加上防斷損長度限制) 👇
           note.currentStep = "Gemini 全局摘要生成中...";
+          _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
           await saveNote(note);
 
           StringBuffer fullRawText = StringBuffer();
@@ -999,6 +994,7 @@ class GlobalManager {
           為了避免 JSON 格式過長損毀，請務必精簡：
           1. summary (重點摘要): 請條列 5 到 8 點最重要的決議或討論精華即可。
           2. tasks (待辦事項): 請仔細提取會議中提到的所有「後續行動」、「待處理事項」、「指派任務」或「未來規劃」。若無明確負責人，請填寫「未定」。請盡量列出所有相關任務，絕對不要回傳空的任務清單！
+          3. sections (會議段落): 請將會議劃分為 5 到 8 個主要階段，startTime 與 endTime 必須是純數字秒數。
 
           請直接回傳純 JSON 格式，必須包含: title, summary(字串陣列), tasks(陣列), sections(陣列，startTime與endTime使用純數字秒數)。
           不要加上 ```json 標籤，直接以 { 開始。
@@ -1008,6 +1004,7 @@ class GlobalManager {
             final summaryResponse = await GeminiRestApi.generateTextOnly(
                 apiKeys, modelsToTry, summaryPrompt, onWait: (msg) async {
               note.currentStep = "全局摘要生成中 - $msg";
+              _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
               await saveNote(note);
             });
             final overviewJson = _parseJson(summaryResponse);
@@ -1052,6 +1049,7 @@ class GlobalManager {
               chunkCount++;
               note.currentStep =
                   "Gemini 講者辨識與淨化 ($chunkCount/$totalBatches)...";
+              _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
               await saveNote(note);
 
               String textPrompt = """
@@ -1076,6 +1074,7 @@ class GlobalManager {
                 final chunkResponse = await GeminiRestApi.generateTextOnly(
                     apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
                   note.currentStep = "講者淨化 ($chunkCount/$totalBatches) - $msg";
+                  _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
                   await saveNote(note);
                 });
 
@@ -1136,6 +1135,7 @@ class GlobalManager {
         if (maxChunks == 0) maxChunks = 1;
 
         note.currentStep = "上傳大型音訊檔案中...";
+        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await saveNote(note);
 
         var fileInfo = await GeminiRestApi.uploadFile(
@@ -1145,6 +1145,7 @@ class GlobalManager {
             lockedKey, fileInfo['name'].split('/').last);
 
         note.currentStep = "AI 正在分析會議摘要...";
+        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await saveNote(note);
 
         String overviewPrompt = """
@@ -1184,6 +1185,7 @@ class GlobalManager {
 
         for (int i = 0; i < maxChunks; i++) {
           note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
+          _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
           await saveNote(note);
           _log(note.currentStep);
 
@@ -1238,6 +1240,7 @@ class GlobalManager {
                 _log("🔄 額度滿載！無縫切換 Key ${_maskKey(lockedKey)}，正在重新上傳音檔...");
 
                 note.currentStep = "額度切換，重傳音檔中...";
+                _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
                 await saveNote(note);
 
                 fileInfo = await GeminiRestApi.uploadFile(
@@ -1247,6 +1250,7 @@ class GlobalManager {
                     lockedKey, fileInfo['name'].split('/').last);
 
                 note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
+                _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
                 await saveNote(note);
               } else {
                 _log("分段 $i 最終分析失敗: $e");
@@ -1274,6 +1278,7 @@ class GlobalManager {
   static Future<void> reCalibrateTranscript(MeetingNote note) async {
     note.status = NoteStatus.processing;
     note.currentStep = "準備校正逐字稿...";
+    _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
@@ -1306,6 +1311,7 @@ class GlobalManager {
         var batchItems = note.transcript.sublist(startIdx, endIdx);
 
         note.currentStep = "AI 正在校正錯字與講者 (${i + 1}/$totalBatches)...";
+        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await saveNote(note);
 
         StringBuffer currentChunk = StringBuffer();
@@ -1335,6 +1341,7 @@ class GlobalManager {
           final chunkResponse = await GeminiRestApi.generateTextOnly(
               apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
             note.currentStep = "校正進度 (${i + 1}/$totalBatches) - $msg";
+            _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
             await saveNote(note);
           });
 
@@ -1354,6 +1361,7 @@ class GlobalManager {
       await saveNote(note);
 
       note.currentStep = "文字校正完畢，正在重整最終摘要...";
+      _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
       await saveNote(note);
       await reSummarizeFromTranscript(note);
     } catch (e) {
@@ -1367,7 +1375,8 @@ class GlobalManager {
 
   static Future<void> reSummarizeFromTranscript(MeetingNote note) async {
     note.status = NoteStatus.processing;
-    note.currentStep = "基於最新逐字稿整理摘要...";
+    note.currentStep = "基於最新逐字稿重整摘要...";
+    _log("🔄 狀態更新: ${note.currentStep}"); // 💡 新增日誌
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
@@ -1381,7 +1390,6 @@ class GlobalManager {
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
 
-      // 👇 1.0.46 修改開始：重摘要時支援合併後的總秒數計算 👇
       double totalSeconds = 0.0;
       List<String> paths =
           note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
@@ -1397,7 +1405,6 @@ class GlobalManager {
         }
       }
       if (totalSeconds <= 0) totalSeconds = 120.0 * 36;
-      // 👆 1.0.46 修改結束 👆
 
       StringBuffer sb = StringBuffer();
       for (var t in note.transcript) {
@@ -1407,29 +1414,38 @@ class GlobalManager {
 
       if (transcriptText.trim().isEmpty) throw Exception("逐字稿為空，無法摘要");
 
+      // 💡 終極防斷尾 Prompt (強制約束陣列數量)
       String prompt = """
       以下是會議逐字稿：
       ---
       $transcriptText
       ---
       請根據上方文字，重新整理會議摘要與任務。
-      【嚴格限制】：
-      1. 內容必須 100% 來自上方文字，絕對禁止腦補任何未在逐字稿中出現的「人名」或「事項」！
-      2. 待辦事項 (tasks)：請仔細提取會議中提到的所有「後續行動」、「待處理事項」或「未來規劃」。如果沒有明確負責人，請填寫「未定」。只要有提到未來要處理的事情，請務必列出，絕對不要回傳空的清單。
-      3. sections 的 startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
+      【嚴格限制與輸出格式】：
+      1. 內容必須 100% 來自上方文字，絕對禁止腦補！
+      2. summary (重點摘要): 請精煉出 5 到 8 點會議核心重點即可。
+      3. tasks (待辦事項): 請仔細提取所有「後續行動」、「待處理事項」或「未來規劃」。若無負責人填寫「未定」。絕對不要回傳空的清單！
+      4. sections (會議段落): 請將這場會議劃分為 5 到 8 個主要階段，startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
       
-      請回傳包含 title, summary, tasks, sections 的純 JSON 格式。
+      【極度重要】：為了避免 JSON 格式過長損毀，請務必保持文字精簡。
+      請直接回傳純 JSON 格式，必須包含: title(字串), summary(陣列), tasks(陣列), sections(陣列)。不要加上 ```json 標籤，直接以 { 開始。
       """;
 
-      final responseText =
-          await GeminiRestApi.generateTextOnly(apiKeys, modelsToTry, prompt);
+      final responseText = await GeminiRestApi.generateTextOnly(
+          apiKeys, modelsToTry, prompt, onWait: (msg) async {
+        note.currentStep = "重整摘要中 - $msg";
+        _log("🔄 狀態更新: ${note.currentStep}");
+        await saveNote(note);
+      });
+
       final overviewJson = _parseJson(responseText);
 
       note.title = overviewJson['title']?.toString() ?? note.title;
       var rawSummary = overviewJson['summary'];
       note.summary = rawSummary is List
           ? rawSummary.map((e) => e.toString()).toList()
-          : ["無法生成摘要"];
+          : ["無法生成摘要 (可能是內容過長導致 AI 輸出中斷)"];
+
       note.tasks = (overviewJson['tasks'] as List<dynamic>?)
               ?.map((e) => TaskItem.fromJson(e))
               .toList() ??
@@ -1447,10 +1463,10 @@ class GlobalManager {
 
       note.status = NoteStatus.success;
       note.currentStep = '';
+      _log("✅ 基於逐字稿重整摘要成功！");
       await saveNote(note);
-      _log("基於逐字稿重分析完成！");
     } catch (e) {
-      _log("重分析失敗: $e");
+      _log("❌ 重分析失敗: $e");
       note.status = NoteStatus.failed;
       note.summary = ["重新摘要失敗: $e"];
       note.currentStep = '';
@@ -2005,6 +2021,7 @@ class _MainAppShellState extends State<MainAppShell>
         var video = await yt.videos.get(url);
         note.title = "YT: ${video.title}";
         note.currentStep = "正在下載音訊串流...";
+        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await GlobalManager.saveNote(note);
 
         var manifest = await yt.videos.streamsClient.getManifest(video.id);
@@ -2058,6 +2075,7 @@ class _MainAppShellState extends State<MainAppShell>
         note.audioPath = audioFile.path;
         note.audioParts = [audioFile.path]; // 💡 新增多檔支援設定
         note.currentStep = '準備進行分析...';
+        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await GlobalManager.saveNote(note);
 
         GlobalManager.analyzeNote(note);
