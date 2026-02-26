@@ -23,9 +23,7 @@ import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
-// 👇 1.0.46 修改開始：更新版本號 👇
-const String APP_VERSION = "1.0.48"; // 💡 STT解析增益
-// 👆 1.0.46 修改結束 👆
+const String APP_VERSION = "1.0.49"; // 💡 取消GROQ上傳失敗使用原生檔案上拋GEMINI
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -291,71 +289,89 @@ class UsageTracker {
 }
 
 class GroqApi {
-  // 💡 新增傳入 vocabList 和 participantList
+  // 💡 新增傳入 participantList
   static Future<List<dynamic>> transcribeAudio(
       String apiKey,
       File audioFile,
       double audioDurationSeconds,
       String sttLanguage,
       List<String> vocabList) async {
-    // 💡 移除了 participantList
-
-    _log("啟動 Groq Whisper V3 引擎進行高精度 STT (語系: $sttLanguage)...");
-    var request = http.MultipartRequest('POST',
-        Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
-
-    request.headers.addAll({'Authorization': 'Bearer $apiKey'});
-    request.fields['model'] = 'whisper-large-v3';
-    request.fields['response_format'] = 'verbose_json';
-    request.fields['temperature'] = '0';
-
-    if (sttLanguage != 'auto') {
-      request.fields['language'] = sttLanguage;
-    }
-
-    // 💡 修正：只給專有名詞，絕對不給人名，避免 Whisper 憑空捏造對話！
     String contextPrefix = "";
     if (vocabList.isNotEmpty) {
       contextPrefix += "專有名詞：${vocabList.join(', ')}。";
     }
 
+    String finalPrompt = "";
     switch (sttLanguage) {
       case 'zh':
-        request.fields['prompt'] = '$contextPrefix這是一段真實的會議錄音，請精準聽寫內容。';
+        finalPrompt = '$contextPrefix這是一段真實的會議錄音，請精準聽寫內容。';
         break;
       case 'en':
-        request.fields['prompt'] =
+        finalPrompt =
             '$contextPrefix This is a real meeting recording, please transcribe accurately.';
         break;
       case 'ja':
-        request.fields['prompt'] =
-            '$contextPrefixこれは実際の会議の録音です。正確に文字起こししてください。';
+        finalPrompt = '$contextPrefixこれは実際の会議の録音です。正確に文字起こししてください。';
         break;
       case 'ko':
-        request.fields['prompt'] = '$contextPrefix실제 회의 녹음입니다. 정확하게 기록해 주세요.';
+        finalPrompt = '$contextPrefix실제 회의 녹음입니다. 정확하게 기록해 주세요.';
         break;
       case 'auto':
       default:
-        request.fields['prompt'] =
-            '${contextPrefix}Meeting transcription. 會議紀錄。会議の文字起こし。회의 기록.';
+        finalPrompt = '${contextPrefix}Meeting transcription. 會議紀錄。';
         break;
     }
 
-    request.files
-        .add(await http.MultipartFile.fromPath('file', audioFile.path));
+    int retries = 3; // 💡 新增：允許網路瞬斷重試 3 次
+    while (retries > 0) {
+      try {
+        if (retries == 3)
+          _log("啟動 Groq 引擎 (語系: $sttLanguage)...");
+        else
+          _log("⚠️ 網路不穩，正在重新嘗試上傳至 Groq (剩餘 $retries 次)...");
 
-    var response = await request.send().timeout(const Duration(minutes: 5));
-    var responseBody = await response.stream.bytesToString();
+        var request = http.MultipartRequest('POST',
+            Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
+        request.headers.addAll({'Authorization': 'Bearer $apiKey'});
+        request.fields['model'] = 'whisper-large-v3';
+        request.fields['response_format'] = 'verbose_json';
+        request.fields['temperature'] = '0';
+        request.fields['prompt'] = finalPrompt;
+        if (sttLanguage != 'auto') request.fields['language'] = sttLanguage;
+        request.files
+            .add(await http.MultipartFile.fromPath('file', audioFile.path));
 
-    if (response.statusCode == 200) {
-      var json = jsonDecode(responseBody);
-      _log("✅ Groq STT 辨識完成！成功取得精準時間軸資料。");
+        var response = await request.send().timeout(const Duration(minutes: 5));
+        var responseBody = await response.stream.bytesToString();
 
-      await UsageTracker.addGroqSeconds(audioDurationSeconds);
+        if (response.statusCode == 200) {
+          var json = jsonDecode(responseBody);
+          _log("✅ Groq STT 辨識完成！");
+          await UsageTracker.addGroqSeconds(audioDurationSeconds);
+          return json['segments'] ?? [];
+        } else {
+          throw Exception(
+              'Groq API 錯誤 (${response.statusCode}): $responseBody');
+        }
+      } catch (e) {
+        retries--;
+        if (retries == 0) rethrow; // 3次都失敗才真的放棄
+        await Future.delayed(const Duration(seconds: 5)); // 等待 5 秒後重試
+      }
+    }
+    return [];
+  }
 
-      return json['segments'] ?? [];
-    } else {
-      throw Exception('Groq API 錯誤 (${response.statusCode}): $responseBody');
+  // 👇 放入 class GroqApi 裡面 👇
+  static Future<void> testApiKey(String apiKey) async {
+    final url = Uri.parse('https://api.groq.com/openai/v1/models');
+    final response = await http.get(
+      url,
+      headers: {'Authorization': 'Bearer $apiKey'},
+    ).timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception('Groq API 測試失敗 (${response.statusCode})');
     }
   }
 }
@@ -816,15 +832,14 @@ class GlobalManager {
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
 
-      // 👇 1.0.46 修改開始：替換為多檔分析與時間偏移邏輯 👇
+      // 👇 替換這個區塊 👇
       List<String> targetParts =
           note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
       double globalOffsetSeconds = 0.0;
       List<dynamic> allWhisperSegments = [];
-      bool useGeminiFallback = false;
 
       if (strategy == 'groq_gemini') {
-        if (groqKey.isEmpty) throw Exception("選擇了高精度雙引擎，但未設定 Groq API Key");
+        if (groqKey.isEmpty) throw Exception("未設定 Groq API Key，請至設定頁面輸入");
 
         for (int i = 0; i < targetParts.length; i++) {
           final partFile = await getActualFile(targetParts[i]);
@@ -836,33 +851,30 @@ class GlobalManager {
           await tempPlayer.dispose();
           double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
 
+          // 💡 修正：超過 25MB 不再偷轉給 Gemini，直接阻擋以保護額度
           if (partFile.lengthSync() / (1024 * 1024) >= 25.0) {
-            useGeminiFallback = true;
-            break; // 超大檔案轉交原生備案
+            throw Exception("單一音檔超過 25MB 限制，Groq 無法處理。");
           }
 
           note.currentStep = "Groq 聽寫中 (段落 ${i + 1}/${targetParts.length})...";
           await saveNote(note);
 
           try {
-            // 💡 1.0.47 修改：將字典傳給 Groq，讓它從源頭就聽懂專有名詞
             var segments = await GroqApi.transcribeAudio(
                 groqKey, partFile, partSecs, sttLanguage, vocabList);
             for (var seg in segments) {
-              // 💡 核心拼接魔法：把每段的時間加上上一段的總長度
               seg['start'] =
                   (seg['start'] as num).toDouble() + globalOffsetSeconds;
               allWhisperSegments.add(seg);
             }
           } catch (e) {
-            _log("Groq 處理段落 ${i + 1} 失敗: $e，轉用原生引擎...");
-            useGeminiFallback = true;
-            break;
+            // 💡 修正：Groq 失敗不再自動切換備案，直接拋出錯誤讓使用者處理
+            throw Exception("Groq 引擎處理失敗: $e");
           }
           globalOffsetSeconds += partSecs;
         }
 
-        if (!useGeminiFallback && allWhisperSegments.isNotEmpty) {
+        if (allWhisperSegments.isNotEmpty) {
           // 彙整所有段落的原始逐字稿
           List<TranscriptItem> rawTranscript = allWhisperSegments.map((seg) {
             return TranscriptItem(
@@ -876,13 +888,16 @@ class GlobalManager {
 
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
+          // --- 替換這個 for 迴圈區塊 ---
           int batchSize = 150;
           int totalBatches = (allWhisperSegments.length / batchSize).ceil();
           int chunkCount = 0;
+          List<dynamic> currentBatchSegments = []; // 💡 新增：用來備份這回合的原始資料
 
           for (var i = 0; i < allWhisperSegments.length; i++) {
             var seg = allWhisperSegments[i];
             currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
+            currentBatchSegments.add(seg); // 💡 存入備份
 
             if ((i + 1) % batchSize == 0 ||
                 i == allWhisperSegments.length - 1) {
@@ -890,19 +905,19 @@ class GlobalManager {
               note.currentStep = "Gemini 講者辨識 ($chunkCount/$totalBatches)...";
               await saveNote(note);
 
+              // 💡 強化 Prompt：要求硬性分類講者與清除贅詞
               String textPrompt = """
               以下是外部 STT 引擎產生的純文字逐字稿（帶有精準時間戳）：
               ---
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【刪除 Prompt 迴圈幻覺】：若出現「請精準聽寫內容」、「這是一段真實的會議錄音」或類似的重複語句，直接整句刪除。
-              2. 【終極幻覺過濾】：YouTube 廣告詞、無意義重複單字一律刪除。
-              3. 【強制字典修正】：參考專有詞彙庫：${vocabList.join(', ')}。找出發音相近的錯字並強制修正。
-              4. 參考最新與會者名單：${participantList.join(', ')}，判斷說話者。
-              5. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
+              1. 【刪除幻覺與贅詞】：刪除「請精準聽寫內容」等重複指令。強力過濾無意義的口語贅詞(如：那個、就是、然後)及環境雜音，若整句皆無實質內容請直接刪除(回傳[])。
+              2. 【強制字典修正】：參考專有詞彙庫：${vocabList.join(', ')}。找出發音相近的錯字並強制修正。
+              3. 【講者辨識】：參考與會者名單：${participantList.join(', ')}。若名單外有其他人發言，【請務必依據對話邏輯標註為「講者A」、「講者B」等】，絕對不可將不同人的對話全部歸類給同一人！
+              4. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
               
-              回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。若該批次全部都是垃圾幻覺，請回傳 []。
+              回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
               """;
 
               try {
@@ -917,11 +932,21 @@ class GlobalManager {
                   fullTranscript.addAll(parsedList
                       .map((e) => TranscriptItem.fromJson(e))
                       .toList());
+                } else {
+                  throw Exception("回傳了空陣列");
                 }
               } catch (e) {
-                _log("⚠️ 第 $chunkCount 批次講者辨識失敗跳過: $e");
+                // 💡 致命錯誤救援：如果 Gemini 爆了(額度滿或解析錯)，絕對不能丟棄資料！直接把 Groq 原始文字塞進去
+                _log("⚠️ 講者辨識失敗，啟動資料保留機制(保留原始聽寫): $e");
+                fullTranscript.addAll(currentBatchSegments
+                    .map((s) => TranscriptItem(
+                        speaker: 'System', // 標為 System 表示未經 AI 分辨
+                        original: s['text'],
+                        startTime: s['start']))
+                    .toList());
               }
               currentChunk.clear();
+              currentBatchSegments.clear(); // 💡 清空備份，準備下一回合
             }
           }
           if (fullTranscript.isNotEmpty) {
@@ -934,10 +959,9 @@ class GlobalManager {
           return;
         }
       }
-      // 👆 1.0.46 修改結束 👆
 
-      // --- Gemini 原生語音處理模式 (如果超大檔備案，僅取第一段處理避免爆炸) ---
-      if (strategy != 'groq_gemini' || useGeminiFallback) {
+      // --- Gemini 原生語音處理模式  ---
+      if (strategy != 'groq_gemini') {
         modelsToTry = strategy == 'pro'
             ? ['gemini-pro-latest', 'gemini-2.5-pro']
             : ['gemini-flash-latest', 'gemini-2.5-flash'];
@@ -1397,8 +1421,14 @@ class _MainAppShellState extends State<MainAppShell>
     super.dispose();
   }
 
+  // --- 替換 didChangeAppLifecycleState 方法 ---
+  AppLifecycleState? _lastLifecycleState; // 💡 新增用來防止重複紀錄
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_lastLifecycleState == state) return; // 狀態沒變就不記錄
+    _lastLifecycleState = state;
+
     setState(() {
       if (state == AppLifecycleState.resumed) {
         _isAppInForeground = true;
@@ -1511,6 +1541,10 @@ class _MainAppShellState extends State<MainAppShell>
             GlobalManager.isRecordingNotifier.value) {
           if (!_isSystemInterrupted) {
             _isSystemInterrupted = true;
+            // 💡 只有在觸發中斷的瞬間，才印出致命的分貝數作為除錯依據
+            GlobalManager.addLog(
+                "⚠️ 系統奪取麥克風！觸發時分貝: ${_lastAmplitude.toStringAsFixed(2)} dB (死寂: $_deadMicCounter, 凍結: $_frozenMicCounter)");
+
             _deadMicCounter = 0;
             _frozenMicCounter = 0;
             _lastAmplitude = 0.0;
@@ -3347,6 +3381,7 @@ class _SettingsPageState extends State<SettingsPage> {
   String _analysisStrategy = 'groq_gemini';
   String _sttLanguage = 'zh';
   bool _isLoadingModels = false;
+  bool _isLoadingGroq = false; // 💡 新增這行
 
   @override
   void initState() {
@@ -3397,6 +3432,29 @@ class _SettingsPageState extends State<SettingsPage> {
       );
     } finally {
       if (mounted) setState(() => _isLoadingModels = false);
+    }
+  }
+
+  // 💡 新增這段方法
+  Future<void> _testGroqConnection() async {
+    final key = _groqKeyController.text.trim();
+    if (key.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text("請先輸入 Groq API Key"), backgroundColor: Colors.orange));
+      return;
+    }
+    setState(() => _isLoadingGroq = true);
+    try {
+      await GroqApi.testApiKey(key);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text("✅ Groq API 測試成功！網路連線正常"),
+          backgroundColor: Colors.green));
+      _saveSettings();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("❌ Groq 測試失敗: $e"), backgroundColor: Colors.red));
+    } finally {
+      if (mounted) setState(() => _isLoadingGroq = false);
     }
   }
 
@@ -3473,21 +3531,45 @@ class _SettingsPageState extends State<SettingsPage> {
               suffixIcon: Icon(Icons.mic_external_on),
             ),
           ),
-          const SizedBox(height: 10),
-          ElevatedButton.icon(
-            onPressed: _isLoadingModels ? null : _testApiConnection,
-            icon: _isLoadingModels
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.network_check),
-            label: Text(_isLoadingModels ? "連線測試中..." : "儲存並測試連線"),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.green.shade50,
-              foregroundColor: Colors.green.shade800,
-            ),
+          // 👇 替換原本的 ElevatedButton.icon 區塊 👇
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _isLoadingModels ? null : _testApiConnection,
+                  icon: _isLoadingModels
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.cloud_done),
+                  label: Text(_isLoadingModels ? "測試中..." : "測試 Gemini"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue.shade50,
+                    foregroundColor: Colors.blue.shade800,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _isLoadingGroq ? null : _testGroqConnection,
+                  icon: _isLoadingGroq
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.mic_external_on),
+                  label: Text(_isLoadingGroq ? "測試中..." : "測試 Groq"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orange.shade50,
+                    foregroundColor: Colors.orange.shade800,
+                  ),
+                ),
+              ),
+            ],
           ),
+          // 👆 替換到這裡 👆
           const SizedBox(height: 20),
           const Text(
             "分析模式 (AI 核心策略)",
