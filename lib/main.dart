@@ -23,7 +23,7 @@ import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 
-const String APP_VERSION = "1.0.50"; // 💡 GEMINI先摘要再逐字稿，重新校正錯字與講者
+const String APP_VERSION = "1.0.51"; // 💡 新增STT引擎Deepgram Nova-2模型
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -256,7 +256,12 @@ class UsageTracker {
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     String? dateStr = prefs.getString('usage_first_date');
-    firstUseDate = DateTime.tryParse(dateStr!);
+
+    // ✅ 必須先確認 dateStr 不是 null，才能進行轉換
+    if (dateStr != null) {
+      firstUseDate = DateTime.tryParse(dateStr);
+    }
+
     if (firstUseDate == null) {
       firstUseDate = DateTime.now();
       await prefs.setString(
@@ -371,6 +376,55 @@ class GroqApi {
 
     if (response.statusCode != 200) {
       throw Exception('Groq API 測試失敗 (${response.statusCode})');
+    }
+  }
+}
+
+class DeepgramApi {
+  static Future<List<dynamic>> transcribeAudio(
+      String apiKey, File audioFile, String sttLanguage) async {
+    // Deepgram 語系對應
+    String langParam = sttLanguage == 'zh' ? 'zh-TW' : sttLanguage;
+    String urlStr =
+        'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true';
+
+    if (langParam == 'auto') {
+      urlStr += '&detect_language=true';
+    } else {
+      urlStr += '&language=$langParam';
+    }
+
+    var request = http.Request('POST', Uri.parse(urlStr));
+    request.headers.addAll({
+      'Authorization': 'Token $apiKey',
+      'Content-Type': 'audio/mp4', // Deepgram 會自動解析音檔格式
+    });
+
+    request.bodyBytes = await audioFile.readAsBytes();
+
+    var response =
+        await http.Client().send(request).timeout(const Duration(minutes: 5));
+    var responseBody = await response.stream.bytesToString();
+
+    if (response.statusCode == 200 || response.statusCode == 201) {
+      var json = jsonDecode(responseBody);
+      // utterances 陣列內含精準的講者分段 (speaker 0, speaker 1...)
+      return json['results']?['utterances'] ?? [];
+    } else {
+      throw Exception(
+          'Deepgram API 錯誤 (${response.statusCode}): $responseBody');
+    }
+  }
+
+  static Future<void> testApiKey(String apiKey) async {
+    final url = Uri.parse('https://api.deepgram.com/v1/projects');
+    final response = await http.get(
+      url,
+      headers: {'Authorization': 'Token $apiKey'},
+    ).timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception('Deepgram API 測試失敗 (${response.statusCode})');
     }
   }
 }
@@ -837,10 +891,16 @@ class GlobalManager {
       List<dynamic> allWhisperSegments = [];
 
       // ==========================================
-      // 🥇 雙引擎模式 (Groq -> 全局摘要 -> 局部淨化)
+      // 🥇 雙引擎模式 (Groq 或 Deepgram -> 全局摘要 -> 局部淨化)
       // ==========================================
-      if (strategy == 'groq_gemini') {
-        if (groqKey.isEmpty) throw Exception("未設定 Groq API Key，請至設定頁面輸入");
+      if (strategy == 'groq_gemini' || strategy == 'deepgram_gemini') {
+        final bool isDeepgram = strategy == 'deepgram_gemini';
+        final String externalKey =
+            isDeepgram ? (prefs.getString('deepgram_api_key') ?? '') : groqKey;
+
+        if (externalKey.isEmpty) {
+          throw Exception("未設定 ${isDeepgram ? 'Deepgram' : 'Groq'} API Key");
+        }
 
         for (int i = 0; i < targetParts.length; i++) {
           final partFile = await getActualFile(targetParts[i]);
@@ -852,61 +912,76 @@ class GlobalManager {
           await tempPlayer.dispose();
           double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
 
-          if (partFile.lengthSync() / (1024 * 1024) >= 25.0) {
+          if (!isDeepgram && partFile.lengthSync() / (1024 * 1024) >= 25.0) {
             throw Exception("單一音檔超過 25MB 限制，Groq 無法處理。");
           }
 
-          note.currentStep = "Groq 聽寫中 (段落 ${i + 1}/${targetParts.length})...";
+          note.currentStep =
+              "${isDeepgram ? 'Deepgram' : 'Groq'} 聽寫中 (段落 ${i + 1}/${targetParts.length})...";
           await saveNote(note);
 
           try {
-            var segments = await GroqApi.transcribeAudio(
-                groqKey, partFile, partSecs, sttLanguage, vocabList);
-            for (var seg in segments) {
-              seg['start'] =
-                  (seg['start'] as num).toDouble() + globalOffsetSeconds;
-              allWhisperSegments.add(seg);
+            if (isDeepgram) {
+              var utterances = await DeepgramApi.transcribeAudio(
+                  externalKey, partFile, sttLanguage);
+              for (var u in utterances) {
+                allWhisperSegments.add({
+                  'start': (u['start'] as num).toDouble() + globalOffsetSeconds,
+                  'text': u['transcript'],
+                  'speaker': 'Speaker ${u['speaker']}' // Deepgram 原生講者標籤
+                });
+              }
+            } else {
+              var segments = await GroqApi.transcribeAudio(
+                  externalKey, partFile, partSecs, sttLanguage, vocabList);
+              for (var seg in segments) {
+                seg['start'] =
+                    (seg['start'] as num).toDouble() + globalOffsetSeconds;
+                seg['speaker'] = 'System'; // Groq 無講者標籤
+                allWhisperSegments.add(seg);
+              }
             }
           } catch (e) {
-            throw Exception("Groq 引擎處理失敗: $e");
+            throw Exception("STT 引擎處理失敗: $e");
           }
           globalOffsetSeconds += partSecs;
         }
 
         if (allWhisperSegments.isNotEmpty) {
-          // 儲存原始逐字稿備底
           List<TranscriptItem> rawTranscript = allWhisperSegments.map((seg) {
             return TranscriptItem(
-              speaker: 'System',
-              original: seg['text'],
-              startTime: seg['start'],
-            );
+                speaker: seg['speaker'],
+                original: seg['text'],
+                startTime: seg['start']);
           }).toList();
           note.transcript = rawTranscript;
           await saveNote(note);
 
-          // 👇 階段一：生成全局摘要 (採納您的絕佳建議) 👇
+          // 👇 階段一：生成全局摘要 (加上防斷損長度限制) 👇
           note.currentStep = "Gemini 全局摘要生成中...";
           await saveNote(note);
 
           StringBuffer fullRawText = StringBuffer();
           for (var seg in allWhisperSegments) {
-            fullRawText.writeln("[${seg['start']}秒] ${seg['text']}");
+            fullRawText.writeln(
+                "[${seg['start']}秒] ${seg['speaker']}: ${seg['text']}");
           }
 
           String summaryPrompt = """
-          這是一份由外部語音辨識系統轉錄的會議原始逐字稿（可能包含錯字、環境雜音或外語幻覺）：
+          這是一份由外部語音系統轉錄的會議原始逐字稿（可能包含錯字或環境雜音）：
           ---
           $fullRawText
           ---
           請根據上述內容，整理出這場會議的「全局重點」。
           專有詞彙庫：${vocabList.join(', ')}。預設與會者名單：${participantList.join(', ')}。
 
-          請回傳純 JSON 格式，必須包含:
-          - title: 會議標題 (字串)
-          - summary: 重點摘要 (字串陣列)
-          - tasks: 待辦事項 (陣列，包含 description, assignee, dueDate)
-          - sections: 會議段落 (陣列，包含 title, startTime, endTime，時間請用純數字秒數)
+          【極度重要輸出限制】：
+          為了避免 JSON 格式過長損毀，請務必精簡：
+          1. summary (重點摘要): 請條列 5 到 8 點最重要的決議或討論精華即可。
+          2. tasks (待辦事項): 僅列出明確有指派人的行動項目。
+
+          請直接回傳純 JSON 格式，必須包含: title, summary(字串陣列), tasks(陣列), sections(陣列，startTime與endTime使用純數字秒數)。
+          不要加上 ```json 標籤，直接以 { 開始。
           """;
 
           try {
@@ -931,13 +1006,12 @@ class GlobalManager {
                     .toList() ??
                 [];
             await saveNote(note);
-            _log("✅ 全局摘要生成成功，準備進入上下文淨化。");
           } catch (e) {
             _log("⚠️ 全局摘要生成失敗: $e");
             note.summary = ["基於原始逐字稿摘要失敗，將在淨化後重試。"];
           }
 
-          // 👇 階段二：帶入「全局上下文」進行講者辨識與幻覺清除 👇
+          // 👇 階段二：帶入上下文進行講者辨識與錯字淨化 👇
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
           int batchSize = 150;
@@ -945,12 +1019,12 @@ class GlobalManager {
           int chunkCount = 0;
           List<dynamic> currentBatchSegments = [];
 
-          // 提取剛剛產生的摘要作為上下文背景
           String contextInfo = note.summary.join('; ');
 
           for (var i = 0; i < allWhisperSegments.length; i++) {
             var seg = allWhisperSegments[i];
-            currentChunk.writeln("[${seg['start']}秒] ${seg['text']}");
+            currentChunk.writeln(
+                "[${seg['start']}秒] ${seg['speaker']}: ${seg['text']}");
             currentBatchSegments.add(seg);
 
             if ((i + 1) % batchSize == 0 ||
@@ -961,21 +1035,21 @@ class GlobalManager {
               await saveNote(note);
 
               String textPrompt = """
-              這是一場會議的局部逐字稿。
               【會議全局上下文】：$contextInfo
               專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
 
-              以下是外部 STT 引擎產生的純文字片段（帶有精準時間戳）：
+              以下是外部 STT 引擎產生的純文字片段（帶有精準時間戳與原始講者代號）：
               ---
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【刪除幻覺與雜音】：強力過濾無意義的口語贅詞。Groq STT 常在無聲處產生「亂碼外語」或「版權宣告」幻覺(如突然出現英文)，若發現與「會議全局上下文」毫不相干的無意義句子，請【直接刪除】(回傳[])！
-              2. 【強制字典修正】：參考專有詞彙庫與上下文，修正發音相近的錯字。
-              3. 【講者辨識】：請根據「上下文邏輯」，精準標註講者（如「講者A」、「講者B」或真實人名）。絕對不可將不同人的對話全部歸類給同一人！
-              4. 絕對嚴格保留原始括號內的 [秒數]，填入 startTime。
+              1. 【講者辨識】：如果原文是 Speaker 0 等代號，請根據上下文邏輯，將其替換為真實人名(如: 講者A 或 名單內人名)。
+              2. 【強制字典修正】：請修正錯字。
+              3. 【極度重要！欄位定義】：請將「修正後的正確繁體中文內容」填入 original 欄位！絕對不可放在 translation 欄位！translation 只有在原文是純外語且需要翻譯成中文時才使用！
+              4. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
+              5. 嚴格保留原始 [秒數] 填入 startTime。
               
-              回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。
+              回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)。
               """;
 
               try {
@@ -997,7 +1071,7 @@ class GlobalManager {
                 _log("⚠️ 第 $chunkCount 批次講者辨識失敗，保留原始聽寫: $e");
                 fullTranscript.addAll(currentBatchSegments
                     .map((s) => TranscriptItem(
-                        speaker: 'System',
+                        speaker: s['speaker'],
                         original: s['text'],
                         startTime: s['start']))
                     .toList());
@@ -1492,14 +1566,17 @@ class _MainAppShellState extends State<MainAppShell>
     _lastLifecycleState = state;
 
     setState(() {
+      _isAppInForeground = state == AppLifecycleState.resumed;
+    });
+
+    // 💡 只有在「錄音進行中」才寫入日誌，保持除錯畫面乾淨
+    if (GlobalManager.isRecordingNotifier.value) {
       if (state == AppLifecycleState.resumed) {
-        _isAppInForeground = true;
         GlobalManager.addLog("📱 [生命週期] APP 回到前景 (Resumed)");
       } else {
-        _isAppInForeground = false;
         GlobalManager.addLog("📱 [生命週期] APP 進入背景 ($state)");
       }
-    });
+    }
   }
 
   void toggleRecording() async {
@@ -3437,13 +3514,15 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _groqKeyController = TextEditingController();
+  final TextEditingController _deepgramKeyController =
+      TextEditingController(); // 💡 新增 Deepgram Key
   final TextEditingController _vocabController = TextEditingController();
   final TextEditingController _participantController = TextEditingController();
 
-  String _analysisStrategy = 'groq_gemini';
+  String _analysisStrategy = 'deepgram_gemini'; // 💡 預設改為 Deepgram
   String _sttLanguage = 'zh';
   bool _isLoadingModels = false;
-  bool _isLoadingGroq = false; // 💡 新增這行
+  bool _isLoadingExternalSTT = false;
 
   @override
   void initState() {
@@ -3456,7 +3535,10 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _groqKeyController.text = prefs.getString('groq_api_key') ?? '';
-      _analysisStrategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
+      _deepgramKeyController.text =
+          prefs.getString('deepgram_api_key') ?? ''; // 讀取
+      _analysisStrategy =
+          prefs.getString('analysis_strategy') ?? 'deepgram_gemini';
       _sttLanguage = prefs.getString('stt_language') ?? 'zh';
     });
   }
@@ -3497,26 +3579,35 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  // 💡 新增這段方法
-  Future<void> _testGroqConnection() async {
-    final key = _groqKeyController.text.trim();
-    if (key.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text("請先輸入 Groq API Key"), backgroundColor: Colors.orange));
-      return;
-    }
-    setState(() => _isLoadingGroq = true);
+  // 💡 合併測試外部 STT 引擎
+  Future<void> _testExternalSTT() async {
+    setState(() => _isLoadingExternalSTT = true);
     try {
-      await GroqApi.testApiKey(key);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text("✅ Groq API 測試成功！網路連線正常"),
-          backgroundColor: Colors.green));
+      if (_analysisStrategy == 'groq_gemini') {
+        if (_groqKeyController.text.isEmpty) {
+          throw Exception("請先輸入 Groq API Key");
+        }
+        await GroqApi.testApiKey(_groqKeyController.text.trim());
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("✅ Groq API 測試成功！"), backgroundColor: Colors.green));
+      } else if (_analysisStrategy == 'deepgram_gemini') {
+        if (_deepgramKeyController.text.isEmpty) {
+          throw Exception("請先輸入 Deepgram API Key");
+        }
+        await DeepgramApi.testApiKey(_deepgramKeyController.text.trim());
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("✅ Deepgram API 測試成功！"),
+            backgroundColor: Colors.green));
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("請先在下方選擇雙引擎模式"), backgroundColor: Colors.orange));
+      }
       _saveSettings();
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text("❌ Groq 測試失敗: $e"), backgroundColor: Colors.red));
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("❌ 測試失敗: $e"), backgroundColor: Colors.red));
     } finally {
-      if (mounted) setState(() => _isLoadingGroq = false);
+      if (mounted) setState(() => _isLoadingExternalSTT = false);
     }
   }
 
@@ -3524,9 +3615,10 @@ class _SettingsPageState extends State<SettingsPage> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('api_key', _apiKeyController.text);
     await prefs.setString('groq_api_key', _groqKeyController.text);
+    await prefs.setString(
+        'deepgram_api_key', _deepgramKeyController.text); // 儲存
     await prefs.setString('analysis_strategy', _analysisStrategy);
     await prefs.setString('stt_language', _sttLanguage);
-
     if (mounted) {
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text("設定已儲存")));
@@ -3565,20 +3657,26 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text(
-            "API 設定 (安全遮蔽)",
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
+          const Text("API 設定 (安全遮蔽)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           TextField(
             controller: _apiKeyController,
             maxLines: 1,
             obscureText: true,
             decoration: const InputDecoration(
-              labelText: "Gemini API Keys",
-              hintText: "多組 Key 請用半形逗號 (,) 分隔，將自動接力",
+                labelText: "Gemini API Keys", border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _deepgramKeyController,
+            maxLines: 1,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: "Deepgram API Key (推薦，內建講者辨識)",
+              hintText: "至 console.deepgram.com 免費申請",
               border: OutlineInputBorder(),
-              suffixIcon: Icon(Icons.lock_outline),
+              suffixIcon: Icon(Icons.mic),
             ),
           ),
           const SizedBox(height: 10),
@@ -3587,13 +3685,12 @@ class _SettingsPageState extends State<SettingsPage> {
             maxLines: 1,
             obscureText: true,
             decoration: const InputDecoration(
-              labelText: "Groq API Key (用於雙引擎 STT)",
-              hintText: "至 console.groq.com 免費申請",
+              labelText: "Groq API Key (備用 STT)",
               border: OutlineInputBorder(),
-              suffixIcon: Icon(Icons.mic_external_on),
+              suffixIcon: Icon(Icons.mic_external_off),
             ),
           ),
-          // 👇 替換原本的 ElevatedButton.icon 區塊 👇
+          const SizedBox(height: 10),
           Row(
             children: [
               Expanded(
@@ -3606,37 +3703,29 @@ class _SettingsPageState extends State<SettingsPage> {
                           child: CircularProgressIndicator(strokeWidth: 2))
                       : const Icon(Icons.cloud_done),
                   label: Text(_isLoadingModels ? "測試中..." : "測試 Gemini"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blue.shade50,
-                    foregroundColor: Colors.blue.shade800,
-                  ),
                 ),
               ),
               const SizedBox(width: 10),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _isLoadingGroq ? null : _testGroqConnection,
-                  icon: _isLoadingGroq
+                  onPressed: _isLoadingExternalSTT ? null : _testExternalSTT,
+                  icon: _isLoadingExternalSTT
                       ? const SizedBox(
                           width: 16,
                           height: 16,
                           child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.mic_external_on),
-                  label: Text(_isLoadingGroq ? "測試中..." : "測試 Groq"),
+                      : const Icon(Icons.settings_voice),
+                  label: Text(_isLoadingExternalSTT ? "測試中..." : "測試 STT 引擎"),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.orange.shade50,
-                    foregroundColor: Colors.orange.shade800,
-                  ),
+                      backgroundColor: Colors.orange.shade50,
+                      foregroundColor: Colors.orange.shade800),
                 ),
               ),
             ],
           ),
-          // 👆 替換到這裡 👆
           const SizedBox(height: 20),
-          const Text(
-            "分析模式 (AI 核心策略)",
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
+          const Text("分析模式 (AI 核心策略)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -3649,10 +3738,13 @@ class _SettingsPageState extends State<SettingsPage> {
                 isExpanded: true,
                 items: const [
                   DropdownMenuItem(
-                      value: 'groq_gemini',
-                      child: Text("🥇 雙引擎模式 (Groq 聽寫 + Gemini 摘要)")),
+                      value: 'deepgram_gemini',
+                      child: Text("🚀 首選模式 (Deepgram STT + Gemini 摘要)")),
                   DropdownMenuItem(
-                      value: 'flash', child: Text("原生備案模式 (純 Gemini Flash)")),
+                      value: 'groq_gemini',
+                      child: Text("🥈 備案模式 (Groq STT + Gemini 摘要)")),
+                  DropdownMenuItem(
+                      value: 'flash', child: Text("原生語音模式 (純 Gemini Flash)")),
                   DropdownMenuItem(
                       value: 'pro', child: Text("精準高密模式 (純 Gemini Pro)")),
                 ],
@@ -3664,53 +3756,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 4),
-          Text(
-            _analysisStrategy == 'groq_gemini'
-                ? "💡 極度推薦：時間軸 100% 準確，解析速度快 10 倍，且極度省 Token。"
-                : (_analysisStrategy == 'flash'
-                    ? "超過 25MB 大檔備案 (速度快)"
-                    : "⚠️ 警告：超過 25MB 大檔備案 (極耗額度)"),
-            style: TextStyle(
-                fontSize: 12,
-                color: _analysisStrategy == 'pro' ? Colors.red : Colors.green),
-          ),
-          const SizedBox(height: 20),
-          const Text(
-            "語音辨識主要語言 (STT Language)",
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey.shade400),
-                borderRadius: BorderRadius.circular(8)),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: _sttLanguage,
-                isExpanded: true,
-                items: const [
-                  DropdownMenuItem(
-                      value: 'zh', child: Text("🇹🇼 繁體中文 (預設，適合中英夾雜)")),
-                  DropdownMenuItem(
-                      value: 'en', child: Text("🇺🇸 英文為主 (English)")),
-                  DropdownMenuItem(value: 'ja', child: Text("🇯🇵 日文為主 (日本語)")),
-                  DropdownMenuItem(value: 'ko', child: Text("🇰🇷 韓文為主 (한국어)")),
-                  DropdownMenuItem(
-                      value: 'auto', child: Text("🌐 自動偵測 (無明顯主導語言時使用)")),
-                ],
-                onChanged: (val) {
-                  setState(() => _sttLanguage = val!);
-                  _saveSettings();
-                },
-              ),
-            ),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            "💡 提示：若會議有明確主導語言請明確選擇，可極大化消滅 STT 幻覺。",
-            style: TextStyle(fontSize: 12, color: Colors.grey),
-          ),
+          const Text("💡 提示：Deepgram 準確率極高且內建完美講者辨識，大幅減少 Gemini 幻覺與猜錯人的機率。",
+              style: TextStyle(fontSize: 12, color: Colors.green)),
           const SizedBox(height: 20),
           Card(
             color: Colors.blue.shade50,
