@@ -562,7 +562,7 @@ class GeminiRestApi {
             if (response.body.contains('RESOURCE_EXHAUSTED')) {
               throw Exception("RESOURCE_EXHAUSTED");
             }
-            _log("⚠️ 請求過於頻繁 (429)，等待 15 秒...");
+            _log("⏳ API 請求過於頻繁 (429)，系統自動等待 15 秒後重試..."); // 💡 補上 Log
             await Future.delayed(const Duration(seconds: 15));
             retryCount++;
             continue;
@@ -587,6 +587,8 @@ class GeminiRestApi {
           }
           if (retryCount < maxRetries - 1 &&
               !e.toString().contains('Generate failed')) {
+            _log(
+                "⚠️ 網路不穩或連線異常 ($e)，短暫等待 10 秒後重試 (${retryCount + 1}/$maxRetries)..."); // 💡 補上 Log
             await Future.delayed(const Duration(seconds: 10));
             retryCount++;
             continue;
@@ -638,6 +640,7 @@ class GeminiRestApi {
                 break;
               } else {
                 if (onWait != null) onWait("請求過快，短暫休眠 15 秒...");
+                _log("⏳ API 請求過於頻繁 (429)，短暫休眠 15 秒..."); // 💡 補上 Log
                 await Future.delayed(const Duration(seconds: 15));
                 retryCount++;
                 continue;
@@ -657,6 +660,8 @@ class GeminiRestApi {
           } catch (e) {
             if (retryCount < maxRetries - 1 &&
                 !e.toString().contains('Generate failed')) {
+              _log(
+                  "⚠️ 連線異常 ($e)，等待 5 秒後重試 (${retryCount + 1}/$maxRetries)..."); // 💡 補上 Log
               await Future.delayed(const Duration(seconds: 5));
               retryCount++;
               continue;
@@ -990,13 +995,22 @@ class GlobalManager {
           請根據上述內容，整理出這場會議的「全局重點」。
           專有詞彙庫：${vocabList.join(', ')}。預設與會者名單：${participantList.join(', ')}。
 
-          【極度重要輸出限制】：
-          為了避免 JSON 格式過長損毀，請務必精簡：
-          1. summary (重點摘要): 請條列 5 到 8 點最重要的決議或討論精華即可。
-          2. tasks (待辦事項): 請仔細提取會議中提到的所有「後續行動」、「待處理事項」、「指派任務」或「未來規劃」。若無明確負責人，請填寫「未定」。請盡量列出所有相關任務，絕對不要回傳空的任務清單！
-          3. sections (會議段落): 請將會議劃分為 5 到 8 個主要階段，startTime 與 endTime 必須是純數字秒數。
-
-          請直接回傳純 JSON 格式，必須包含: title, summary(字串陣列), tasks(陣列), sections(陣列，startTime與endTime使用純數字秒數)。
+          【極度重要輸出限制與 JSON 格式】：
+          請務必精簡，並「嚴格遵守」以下 JSON Key 的命名與陣列結構：
+          {
+            "title": "會議標題",
+            "summary": ["重點1", "重點2", "重點3... (請列 5~8 點)"],
+            "tasks": [
+              {"description": "任務具體描述", "assignee": "負責人或未定", "dueDate": "期限或未定"}
+            ],
+            "sections": [
+              {"title": "段落標題", "startTime": 0, "endTime": 120}
+            ]
+          }
+          注意：
+          - tasks (待辦事項): 請仔細提取所有「後續行動」或「未來規劃」。如果完全沒有，請填入 [{"description": "無待辦事項", "assignee": "-", "dueDate": "-"}]，絕對不要給空陣列 [] 或省略欄位！
+          - sections (會議段落): 請將會議劃分為 5 到 8 個階段，startTime 與 endTime 必須是純數字秒數。
+          
           不要加上 ```json 標籤，直接以 { 開始。
           """;
 
@@ -1063,7 +1077,7 @@ class GlobalManager {
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
               1. 【講者辨識】：如果原文是 Speaker 0 等代號，請根據上下文邏輯，將其替換為真實人名(如: 講者A 或 名單內人名)。
               2. 【強制字典修正】：請修正錯字。
-              3. 【極度重要！欄位定義】：請將「修正後的正確繁體中文內容」填入 original 欄位！絕對不可放在 translation 欄位！translation 只有在原文是純外語且需要翻譯成中文時才使用！
+              3. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
               4. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
               5. 嚴格保留原始 [秒數] 填入 startTime。
               
@@ -1333,7 +1347,8 @@ class GlobalManager {
         2. 參考最新專有詞彙庫：${vocabList.join(', ')}。修正錯字。
         3. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意，重新精準判斷說話者是誰。
         4. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
-        
+        5. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
+
         請回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。若全段皆為幻覺，回傳 []。
         """;
 
@@ -1421,14 +1436,23 @@ class GlobalManager {
       $transcriptText
       ---
       請根據上方文字，重新整理會議摘要與任務。
-      【嚴格限制與輸出格式】：
+      【嚴格限制與 JSON 格式】：
       1. 內容必須 100% 來自上方文字，絕對禁止腦補！
-      2. summary (重點摘要): 請精煉出 5 到 8 點會議核心重點即可。
-      3. tasks (待辦事項): 請仔細提取所有「後續行動」、「待處理事項」或「未來規劃」。若無負責人填寫「未定」。絕對不要回傳空的清單！
-      4. sections (會議段落): 請將這場會議劃分為 5 到 8 個主要階段，startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
+      2. 為了避免 JSON 格式解析失敗，請「嚴格遵守」以下 JSON 結構：
+      {
+        "title": "會議標題",
+        "summary": ["重點1", "重點2", "重點3... (請列 5~8 點)"],
+        "tasks": [
+          {"description": "任務具體描述", "assignee": "負責人或未定", "dueDate": "期限或未定"}
+        ],
+        "sections": [
+          {"title": "段落標題", "startTime": 12.5, "endTime": 45.0}
+        ]
+      }
+      3. tasks (待辦事項): 請提取所有後續行動。如果完全沒有，請填入 [{"description": "無待辦事項", "assignee": "-", "dueDate": "-"}]，絕對不要給空陣列 []。
+      4. sections (會議段落): startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
       
-      【極度重要】：為了避免 JSON 格式過長損毀，請務必保持文字精簡。
-      請直接回傳純 JSON 格式，必須包含: title(字串), summary(陣列), tasks(陣列), sections(陣列)。不要加上 ```json 標籤，直接以 { 開始。
+      請直接回傳純 JSON 格式。不要加上 ```json 標籤，直接以 { 開始。
       """;
 
       final responseText = await GeminiRestApi.generateTextOnly(
@@ -1469,6 +1493,114 @@ class GlobalManager {
       _log("❌ 重分析失敗: $e");
       note.status = NoteStatus.failed;
       note.summary = ["重新摘要失敗: $e"];
+      note.currentStep = '';
+      await saveNote(note);
+    }
+  }
+
+  static Future<void> translateTranscript(
+      MeetingNote note, String targetLang) async {
+    note.status = NoteStatus.processing;
+    note.currentStep = "準備翻譯逐字稿...";
+    _log("🔄 狀態更新: ${note.currentStep}");
+    await saveNote(note);
+
+    final prefs = await SharedPreferences.getInstance();
+    final List<String> apiKeys = await getApiKeys();
+    final String strategy =
+        prefs.getString('analysis_strategy') ?? 'groq_gemini';
+
+    try {
+      if (apiKeys.isEmpty) throw Exception("請先設定 API Key");
+      if (note.transcript.isEmpty) throw Exception("逐字稿為空，無法翻譯");
+
+      List<String> modelsToTry = strategy == 'pro'
+          ? ['gemini-pro-latest', 'gemini-2.5-pro']
+          : ['gemini-flash-latest', 'gemini-2.5-flash'];
+
+      String langName = "";
+      String phoneticInstruction = "";
+      if (targetLang == 'en') {
+        langName = "英文 (English)";
+        phoneticInstruction = "phonetic 欄位請留空。";
+      } else if (targetLang == 'ja') {
+        langName = "日文 (日本語)";
+        phoneticInstruction = "phonetic 欄位請務必提供「羅馬拼音 (Romaji)」。";
+      } else if (targetLang == 'ko') {
+        langName = "韓文 (한국어)";
+        phoneticInstruction = "phonetic 欄位請務必提供「羅馬拼音 (Romaja)」。";
+      } else if (targetLang == 'zh') {
+        langName = "繁體中文";
+        phoneticInstruction = "phonetic 欄位請提供「漢語拼音」。";
+      }
+
+      int batchSize = 100; // 💡 批次翻譯，避免 token 爆表
+      int totalBatches = (note.transcript.length / batchSize).ceil();
+
+      for (int i = 0; i < totalBatches; i++) {
+        int startIdx = i * batchSize;
+        int endIdx = min((i + 1) * batchSize, note.transcript.length);
+        var batchItems = note.transcript.sublist(startIdx, endIdx);
+
+        note.currentStep = "AI 正在翻譯為 $langName (${i + 1}/$totalBatches)...";
+        _log("🔄 狀態更新: ${note.currentStep}");
+        await saveNote(note);
+
+        StringBuffer currentChunk = StringBuffer();
+        for (var item in batchItems) {
+          currentChunk.writeln(
+              "[${item.startTime}秒] ${item.speaker}: ${item.original}");
+        }
+
+        String textPrompt = """
+        請將以下會議逐字稿內容，翻譯為「$langName」。
+        ---
+        $currentChunk
+        ---
+        【嚴格限制與 JSON 格式】：
+        1. 絕對不可刪減或合併句子，輸入有幾句，輸出就必須有幾句。
+        2. 請將原文保留在 `original` 欄位。
+        3. 請將翻譯結果填入 `translation` 欄位。
+        4. $phoneticInstruction
+        5. 嚴格保留原始 [秒數] 填入 startTime 欄位，說話者填入 speaker 欄位。
+        
+        請直接回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。
+        """;
+
+        try {
+          final chunkResponse = await GeminiRestApi.generateTextOnly(
+              apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
+            note.currentStep = "翻譯進度 (${i + 1}/$totalBatches) - $msg";
+            await saveNote(note);
+          });
+
+          final List<dynamic> parsedList = _parseJsonList(chunkResponse);
+          if (parsedList.isNotEmpty) {
+            // 💡 利用時間戳將翻譯結果寫回原陣列
+            for (var p in parsedList) {
+              var tItem = TranscriptItem.fromJson(p);
+              var matchIdx = batchItems.indexWhere(
+                  (b) => (b.startTime - tItem.startTime).abs() < 0.1);
+              if (matchIdx != -1) {
+                note.transcript[startIdx + matchIdx].translation =
+                    tItem.translation;
+                note.transcript[startIdx + matchIdx].phonetic = tItem.phonetic;
+              }
+            }
+          }
+        } catch (e) {
+          _log("⚠️ 第 ${i + 1} 批次翻譯失敗，保留該段原文: $e");
+        }
+      }
+
+      note.status = NoteStatus.success;
+      note.currentStep = '';
+      _log("✅ 逐字稿翻譯完成 ($langName)");
+      await saveNote(note);
+    } catch (e) {
+      _log("❌ 翻譯流程錯誤: $e");
+      note.status = NoteStatus.failed;
+      note.summary.insert(0, "翻譯失敗: $e");
       note.currentStep = '';
       await saveNote(note);
     }
@@ -2568,7 +2700,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     super.dispose();
   }
 
-  // 👇 1.0.46 修改開始：播放器控制邏輯適配多檔案 👇
+  // 👇 1.0.54 修改雙擊播放 👇
   Future<void> _playPause() async {
     if (_isPlaying) {
       await _audioPlayer.pause();
@@ -2579,11 +2711,23 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       File actualFile =
           await GlobalManager.getActualFile(paths[_currentPlayingPartIndex]);
       if (await actualFile.exists()) {
-        await _audioPlayer.play(DeviceFileSource(actualFile.path));
+        if (_audioPlayer.source == null) {
+          await _audioPlayer.play(DeviceFileSource(actualFile.path));
+        } else {
+          await _audioPlayer.resume(); // 💡 修正：如果已經有來源，直接解除暫停
+        }
       } else {
         ScaffoldMessenger.of(context)
             .showSnackBar(const SnackBar(content: Text("找不到此音檔，可能已被系統清除")));
       }
+    }
+  }
+
+  Future<void> _seekAndPlay(double seconds) async {
+    await _seekTo(seconds);
+    await Future.delayed(const Duration(milliseconds: 150)); // 💡 給予 seek 緩衝時間
+    if (!_isPlaying) {
+      await _audioPlayer.resume(); // 💡 修正：強制使用 resume() 解除暫停
     }
   }
 
@@ -2621,12 +2765,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       }
     }
   }
-
-  Future<void> _seekAndPlay(double seconds) async {
-    await _seekTo(seconds);
-    if (!_isPlaying) await _playPause();
-  }
-  // 👆 1.0.46 修改結束 👆
 
   Future<void> _saveNoteUpdate() async {
     await GlobalManager.saveNote(_note);
@@ -2710,6 +2848,59 @@ class _NoteDetailPageState extends State<NoteDetailPage>
             child: const Text("徹底語音重聽", style: TextStyle(color: Colors.red)),
           ),
         ],
+      ),
+    );
+  }
+
+  void _showTranslateDialog() {
+    String selectedLang = 'en'; // 預設英文
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setStateSB) => AlertDialog(
+          title: const Text("翻譯逐字稿"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("請選擇目標語言，AI 將為您產生對應的翻譯與拼音。"),
+              const SizedBox(height: 16),
+              DropdownButton<String>(
+                isExpanded: true,
+                value: selectedLang,
+                items: const [
+                  DropdownMenuItem(value: 'en', child: Text("英文 (English)")),
+                  DropdownMenuItem(
+                      value: 'ja', child: Text("日文 (日本語 + Romaji)")),
+                  DropdownMenuItem(
+                      value: 'ko', child: Text("韓文 (한국어 + Romaja)")),
+                  DropdownMenuItem(value: 'zh', child: Text("繁體中文 (+ 漢語拼音)")),
+                ],
+                onChanged: (val) {
+                  setStateSB(() => selectedLang = val!);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                setState(() {
+                  _note.status = NoteStatus.processing;
+                  _note.summary = ["AI 正在翻譯逐字稿..."];
+                });
+                GlobalManager.translateTranscript(_note, selectedLang)
+                    .then((_) {
+                  if (mounted) _reloadNote();
+                });
+              },
+              child: const Text("開始翻譯"),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3160,6 +3351,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               onPressed: _reAnalyze),
           PopupMenuButton<String>(
             onSelected: (value) {
+              if (value == 'translate') _showTranslateDialog(); // 💡 新增這行
               if (value == 'pdf') _generatePdf();
               if (value == 'csv') _exportCsv();
               if (value == 'md') _exportMarkdown();
@@ -3168,6 +3360,10 @@ class _NoteDetailPageState extends State<NoteDetailPage>
               if (value == 'delete') _confirmDelete();
             },
             itemBuilder: (context) => [
+              const PopupMenuItem(
+                  value: 'translate',
+                  child: Text("🌐 翻譯逐字稿",
+                      style: TextStyle(color: Colors.teal))), // 💡 新增這行
               const PopupMenuItem(value: 'pdf', child: Text("匯出 PDF")),
               const PopupMenuItem(value: 'csv', child: Text("匯出 Excel (CSV)")),
               const PopupMenuItem(value: 'md', child: Text("匯出 Markdown")),
@@ -3719,7 +3915,9 @@ class _SettingsPageState extends State<SettingsPage> {
             maxLines: 1,
             obscureText: true,
             decoration: const InputDecoration(
-                labelText: "Gemini API Keys", border: OutlineInputBorder()),
+                labelText: "Gemini API Keys",
+                hintText: "可輸入多把 Key，請用半形逗號 , 分隔", // 💡 補回這行提示
+                border: OutlineInputBorder()),
           ),
           const SizedBox(height: 10),
           TextField(
@@ -3812,6 +4010,35 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 4),
           const Text("💡 提示：Deepgram 準確率極高且內建完美講者辨識，大幅減少 Gemini 幻覺與猜錯人的機率。",
               style: TextStyle(fontSize: 12, color: Colors.green)),
+          const SizedBox(height: 20),
+
+          // 👇 💡 補回：STT 語系選擇 UI 👇
+          const Text("主要錄音語系 (STT 引擎提示)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade400),
+                borderRadius: BorderRadius.circular(8)),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: _sttLanguage,
+                isExpanded: true,
+                items: const [
+                  DropdownMenuItem(value: 'zh', child: Text("繁體中文 (zh-TW)")),
+                  DropdownMenuItem(value: 'en', child: Text("英文 (English)")),
+                  DropdownMenuItem(value: 'ja', child: Text("日文 (日本語)")),
+                  DropdownMenuItem(value: 'ko', child: Text("韓文 (한국어)")),
+                  DropdownMenuItem(value: 'auto', child: Text("自動偵測 (Auto)")),
+                ],
+                onChanged: (val) {
+                  setState(() => _sttLanguage = val!);
+                  _saveSettings();
+                },
+              ),
+            ),
+          ),
           const SizedBox(height: 20),
           Card(
             color: Colors.blue.shade50,
