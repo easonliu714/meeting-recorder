@@ -22,8 +22,9 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'dart:isolate';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
+import 'package:url_launcher/url_launcher.dart';
 
-const String APP_VERSION = "1.0.53"; // 💡 修正全局摘要問題
+const String APP_VERSION = "1.0.55"; // 💡 新增YT下載失敗時跳出外部瀏覽器下載YT音檔
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -2213,22 +2214,36 @@ class _MainAppShellState extends State<MainAppShell>
         GlobalManager.analyzeNote(note);
       } catch (e) {
         String errorMsg = e.toString();
-        if (errorMsg.contains("TimeoutException") ||
-            errorMsg.contains("SocketException") ||
-            errorMsg.contains("host lookup")) {
-          errorMsg =
-              "YouTube 伺服器已阻擋此連線 (防爬蟲機制)。\n💡 建議：請透過瀏覽器使用外部工具下載為音檔後，改用匯入上傳。";
-        }
-
         GlobalManager.addLog("YT處理最終失敗: $errorMsg");
         note.status = NoteStatus.failed;
         note.summary = ["下載失敗:\n$errorMsg"];
         note.currentStep = '';
         await GlobalManager.saveNote(note);
+
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text("YouTube 載入失敗，請查看紀錄了解詳情"),
-              backgroundColor: Colors.red));
+          showDialog(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text("YouTube 解析失敗"),
+              content: const Text(
+                  "可能受到 YouTube 防爬蟲機制阻擋。\n是否為您開啟外部下載網頁 (yt5s.rip)？\n\n💡 請在網頁下載完 MP4 或 MP3 後，回到 APP 點擊「匯入本地錄音/音檔」。"),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text("取消"),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    // 💡 呼叫外部瀏覽器開啟下載網站
+                    launchUrl(Uri.parse("https://yt5s.rip/en11/"),
+                        mode: LaunchMode.externalApplication);
+                  },
+                  child: const Text("開啟下載網頁"),
+                ),
+              ],
+            ),
+          );
         }
       } finally {
         yt.close();
@@ -3789,14 +3804,52 @@ class _SettingsPageState extends State<SettingsPage> {
     });
   }
 
+  void _showApiKeyGuide(String type) {
+    String title = "";
+    String url = "";
+    String steps = "";
+
+    if (type == 'gemini') {
+      title = "取得 Gemini API Key";
+      url = "https://aistudio.google.com/app/apikey";
+      steps =
+          "1. 點擊下方按鈕前往 Google AI Studio\n2. 登入 Google 帳號\n3. 點擊畫面上的「Create API key」\n4. 複製金鑰並貼上至此處";
+    } else if (type == 'deepgram') {
+      title = "取得 Deepgram API Key";
+      url = "https://console.deepgram.com/";
+      steps =
+          "1. 點擊下方按鈕前往 Deepgram\n2. 註冊並登入帳號 (註冊即贈 \$200 額度)\n3. 在左側選單進入「API Keys」\n4. 點擊「Create a New API Key」\n5. 複製金鑰並貼上至此處";
+    } else if (type == 'groq') {
+      title = "取得 Groq API Key";
+      url = "https://console.groq.com/keys";
+      steps =
+          "1. 點擊下方按鈕前往 Groq Cloud\n2. 登入帳號\n3. 點擊「Create API Key」\n4. 複製金鑰並貼上至此處";
+    }
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(steps),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+            },
+            child: const Text("前往申請"),
+          )
+        ],
+      ),
+    );
+  }
+
   Future<void> _testApiConnection() async {
     final rawKeys = _apiKeyController.text.trim();
     if (rawKeys.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text("請先輸入 Gemini API Key"),
-            backgroundColor: Colors.orange),
-      );
+      _showApiKeyGuide('gemini'); // 💡 空白時彈出教學
       return;
     }
 
@@ -3827,19 +3880,23 @@ class _SettingsPageState extends State<SettingsPage> {
 
   // 💡 合併測試外部 STT 引擎
   Future<void> _testExternalSTT() async {
+    // 💡 測試前先檢查是否空白，空白就彈出教學並中斷
+    if (_analysisStrategy == 'groq_gemini' && _groqKeyController.text.isEmpty) {
+      _showApiKeyGuide('groq');
+      return;
+    }
+    if (_analysisStrategy == 'deepgram_gemini' &&
+        _deepgramKeyController.text.isEmpty) {
+      _showApiKeyGuide('deepgram');
+      return;
+    }
     setState(() => _isLoadingExternalSTT = true);
     try {
       if (_analysisStrategy == 'groq_gemini') {
-        if (_groqKeyController.text.isEmpty) {
-          throw Exception("請先輸入 Groq API Key");
-        }
         await GroqApi.testApiKey(_groqKeyController.text.trim());
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content: Text("✅ Groq API 測試成功！"), backgroundColor: Colors.green));
       } else if (_analysisStrategy == 'deepgram_gemini') {
-        if (_deepgramKeyController.text.isEmpty) {
-          throw Exception("請先輸入 Deepgram API Key");
-        }
         await DeepgramApi.testApiKey(_deepgramKeyController.text.trim());
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content: Text("✅ Deepgram API 測試成功！"),

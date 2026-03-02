@@ -1,7 +1,7 @@
 name: myapp
 description: "A new Flutter project."
 publish_to: 'none'
-version: 1.0.54+1
+version: 1.0.55+1
 
 environment:
   sdk: ^3.5.0
@@ -42,6 +42,7 @@ dependencies:
   
   # YouTube
   youtube_explode_dart: ^3.0.5
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:
