@@ -24,7 +24,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 import 'package:url_launcher/url_launcher.dart';
 
-const String APP_VERSION = "1.0.55"; // 💡 新增YT下載失敗時跳出外部瀏覽器下載YT音檔
+const String APP_VERSION = "1.0.56"; // 💡 新增「錯字記憶庫」功能
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -707,6 +707,8 @@ class GlobalManager {
   static final ValueNotifier<bool> isRecordingNotifier = ValueNotifier(false);
   static final ValueNotifier<List<String>> vocabListNotifier =
       ValueNotifier([]);
+  static ValueNotifier<List<String>> typoListNotifier =
+      ValueNotifier([]); // 💡 1. 新增錯字記憶庫
   static final ValueNotifier<List<String>> participantListNotifier =
       ValueNotifier([]);
   static final ValueNotifier<List<String>> logsNotifier = ValueNotifier([]);
@@ -756,6 +758,9 @@ class GlobalManager {
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     vocabListNotifier.value = prefs.getStringList('vocab_list') ?? [];
+    typoListNotifier.value =
+        prefs.getStringList('typo_list') ?? []; // 💡 2. 啟動時載入
+    //
     participantListNotifier.value =
         prefs.getStringList('participant_list') ?? [];
     logsNotifier.value = prefs.getStringList('app_logs') ?? [];
@@ -764,6 +769,13 @@ class GlobalManager {
 
     await UsageTracker.load();
     await loadNotes();
+  }
+
+  // 💡 3. 新增儲存錯字清單的方法
+  static Future<void> saveTypoList(List<String> list) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('typo_list', list);
+    typoListNotifier.value = list;
   }
 
   static Future<void> loadNotes() async {
@@ -1067,6 +1079,12 @@ class GlobalManager {
               _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
               await saveNote(note);
 
+              // 👇 💡 提取錯字記憶庫 👇
+              final List<String> typoList = typoListNotifier.value;
+              String typoInstruction = typoList.isNotEmpty
+                  ? "【歷史錯字替換】：請嚴格參考此對應表(錯字 ➡️ 正確字)，將原文中聽錯的字強制替換為正確字：${typoList.join(' , ')}"
+                  : "";
+
               String textPrompt = """
               【會議全局上下文】：$contextInfo
               專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
@@ -1076,10 +1094,11 @@ class GlobalManager {
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【講者辨識】：如果原文是 Speaker 0 等代號，請根據上下文邏輯，將其替換為真實人名(如: 講者A 或 名單內人名)。
+              1. 【講者辨識與人名強制校正】：將 Speaker 0 等代號替換為真實人名。若對話內文中出現任何「發音相近的人名」，請務必與「預期與會者名單」進行拼音比對，並強制校正為正確人名！
               2. 【強制字典修正】：請修正錯字。
               3. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
               4. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
+              $typoInstruction   // 💡 注入錯字記憶庫指令
               5. 嚴格保留原始 [秒數] 填入 startTime。
               
               回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)。
@@ -1335,6 +1354,12 @@ class GlobalManager {
               "[${item.startTime}秒] ${item.speaker}: ${item.original}");
         }
 
+        // 👇 💡 提取錯字記憶庫 👇
+        final List<String> typoList = typoListNotifier.value;
+        String typoInstruction = typoList.isNotEmpty
+            ? "【歷史錯字替換】：請嚴格參考此對應表(錯字 ➡️ 正確字)，將原文中聽錯的字強制替換為正確字：${typoList.join(' , ')}"
+            : "";
+
         String textPrompt = """
         這是一場會議的局部逐字稿。
         【會議全局上下文】：$contextInfo
@@ -1346,7 +1371,8 @@ class GlobalManager {
         請扮演極度嚴格的「會議記錄淨化員」，執行以下「校正」任務：
         1. 【終極幻覺過濾】：請掃描並直接「整句刪除」STT 幻覺垃圾訊息。若發現與「會議全局上下文」毫不相干的外語亂碼或無意義疊字，請直接捨棄該句！
         2. 參考最新專有詞彙庫：${vocabList.join(', ')}。修正錯字。
-        3. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意，重新精準判斷說話者是誰。
+        3. 參考最新與會者名單：${participantList.join(', ')}。根據上下文重新判斷說話者。並請嚴格比對逐字稿內文的發音，將錯誤的人名強制修正為名單內的正確人名。
+        $typoInstruction   // 💡 注入錯字記憶庫指令
         4. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
         5. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
 
@@ -3099,6 +3125,76 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     }
                   },
                 ),
+                // 👇 💡 新增：加入錯字記憶庫的快捷按鈕 👇
+                IconButton(
+                  icon: const Icon(Icons.spellcheck, color: Colors.purple),
+                  tooltip: "將框選文字加入錯字記憶庫",
+                  onPressed: () {
+                    String selectedText = "";
+                    if (controller.selection.isValid &&
+                        !controller.selection.isCollapsed) {
+                      selectedText =
+                          controller.selection.textInside(controller.text);
+                    }
+                    TextEditingController wrongCtrl =
+                        TextEditingController(text: selectedText);
+                    TextEditingController correctCtrl = TextEditingController();
+
+                    showDialog(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        title: const Text("新增錯字記憶"),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            TextField(
+                              controller: wrongCtrl,
+                              decoration: const InputDecoration(
+                                  labelText: "AI 常聽錯的字 (如: 頻狗)"),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: correctCtrl,
+                              decoration: const InputDecoration(
+                                  labelText: "要替換的正確字 (如: 蘋果)"),
+                              autofocus: true,
+                            ),
+                          ],
+                        ),
+                        actions: [
+                          TextButton(
+                              onPressed: () => Navigator.pop(ctx),
+                              child: const Text("取消")),
+                          FilledButton(
+                            onPressed: () {
+                              final w = wrongCtrl.text.trim();
+                              final c = correctCtrl.text.trim();
+                              if (w.isNotEmpty && c.isNotEmpty) {
+                                final list = List<String>.from(
+                                    GlobalManager.typoListNotifier.value);
+                                list.add("$w ➡️ $c");
+                                GlobalManager.saveTypoList(list);
+
+                                // 💡 貼心功能：自動幫使用者把當前輸入框內的錯字替換掉！
+                                setState(() {
+                                  controller.text =
+                                      controller.text.replaceAll(w, c);
+                                });
+
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                        content: Text("已加入記憶庫並自動替換：$w ➡️ $c")));
+                                Navigator.pop(ctx);
+                              }
+                            },
+                            child: const Text("儲存"),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+                // 👆 💡 新增結束 👆
               ],
             ),
           ],
@@ -3779,6 +3875,9 @@ class _SettingsPageState extends State<SettingsPage> {
       TextEditingController(); // 💡 新增 Deepgram Key
   final TextEditingController _vocabController = TextEditingController();
   final TextEditingController _participantController = TextEditingController();
+  // 👇 💡 增加這兩行
+  final TextEditingController _typoWrongController = TextEditingController();
+  final TextEditingController _typoCorrectController = TextEditingController();
 
   String _analysisStrategy = 'deepgram_gemini'; // 💡 預設改為 Deepgram
   String _sttLanguage = 'zh';
@@ -4097,6 +4196,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 20),
+          // 👇 💡 細化各項目成本的 UI 👇
           Card(
             color: Colors.blue.shade50,
             child: Padding(
@@ -4123,16 +4223,16 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                      "🎙️ Deepgram STT 音訊: ${(UsageTracker.deepgramAudioSeconds / 3600).toStringAsFixed(2)} 小時",
-                      style:
-                          const TextStyle(fontSize: 13)), // 💡 新增 Deepgram 顯示
-                  Text(
-                      "🎙️ Groq STT 音訊: ${(UsageTracker.groqAudioSeconds / 3600).toStringAsFixed(2)} 小時",
-                      style: const TextStyle(fontSize: 13)),
-                  Text("📝 Gemini 純文字請求: ${UsageTracker.geminiTextRequests} 次",
+                      "🎙️ Deepgram STT 音訊: ${(UsageTracker.deepgramAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${deepgramCost.toStringAsFixed(3)})",
                       style: const TextStyle(fontSize: 13)),
                   Text(
-                      "🔊 Gemini 備案音訊: ${(UsageTracker.geminiAudioSeconds / 3600).toStringAsFixed(2)} 小時",
+                      "🎙️ Groq STT 音訊: ${(UsageTracker.groqAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${groqCost.toStringAsFixed(3)})",
+                      style: const TextStyle(fontSize: 13)),
+                  Text(
+                      "📝 Gemini 純文字請求: ${UsageTracker.geminiTextRequests} 次 (\$${geminiTextCost.toStringAsFixed(3)})",
+                      style: const TextStyle(fontSize: 13)),
+                  Text(
+                      "🔊 Gemini 備案音訊: ${(UsageTracker.geminiAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${geminiAudioCost.toStringAsFixed(3)})",
                       style: const TextStyle(fontSize: 13)),
                   const Divider(),
                   Row(
@@ -4158,6 +4258,144 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 20),
+
+          // 👇 💡 新增：錯字記憶庫管理 UI 👇
+          const Text("錯字記憶庫 (AI 智能校正)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text("當 AI 常把特定發音聽錯時，可設定強制取代 (例如: 頻狗 ➡️ 蘋果)",
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _typoWrongController,
+                  decoration: const InputDecoration(
+                      labelText: "常聽錯的字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Icon(Icons.arrow_forward)),
+              Expanded(
+                child: TextField(
+                  controller: _typoCorrectController,
+                  decoration: const InputDecoration(
+                      labelText: "正確字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              IconButton(
+                icon:
+                    const Icon(Icons.add_circle, color: Colors.blue, size: 36),
+                onPressed: () {
+                  final w = _typoWrongController.text.trim();
+                  final c = _typoCorrectController.text.trim();
+                  if (w.isNotEmpty && c.isNotEmpty) {
+                    final list =
+                        List<String>.from(GlobalManager.typoListNotifier.value);
+                    list.add("$w ➡️ $c");
+                    GlobalManager.saveTypoList(list);
+                    _typoWrongController.clear();
+                    _typoCorrectController.clear();
+                  }
+                },
+              )
+            ],
+          ),
+          const SizedBox(height: 8),
+          ValueListenableBuilder<List<String>>(
+            valueListenable: GlobalManager.typoListNotifier,
+            builder: (context, list, _) {
+              return Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: list.map((item) {
+                  return Chip(
+                    label: Text(item),
+                    deleteIcon: const Icon(Icons.cancel, size: 18),
+                    onDeleted: () {
+                      final newList = List<String>.from(list)..remove(item);
+                      GlobalManager.saveTypoList(newList);
+                    },
+                  );
+                }).toList(),
+              );
+            },
+          ),
+          const SizedBox(height: 20),
+          // 👇 💡 新增：錯字記憶庫管理 UI 👇
+          const Text("錯字記憶庫 (AI 智能校正)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text("當 AI 常把特定發音聽錯時，可設定強制取代 (例如: 頻狗 ➡️ 蘋果)",
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _typoWrongController,
+                  decoration: const InputDecoration(
+                      labelText: "常聽錯的字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Icon(Icons.arrow_forward)),
+              Expanded(
+                child: TextField(
+                  controller: _typoCorrectController,
+                  decoration: const InputDecoration(
+                      labelText: "正確字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              IconButton(
+                icon:
+                    const Icon(Icons.add_circle, color: Colors.blue, size: 36),
+                onPressed: () {
+                  final w = _typoWrongController.text.trim();
+                  final c = _typoCorrectController.text.trim();
+                  if (w.isNotEmpty && c.isNotEmpty) {
+                    final list =
+                        List<String>.from(GlobalManager.typoListNotifier.value);
+                    list.add("$w ➡️ $c");
+                    GlobalManager.saveTypoList(list);
+                    _typoWrongController.clear();
+                    _typoCorrectController.clear();
+                  }
+                },
+              )
+            ],
+          ),
+          const SizedBox(height: 8),
+          ValueListenableBuilder<List<String>>(
+            valueListenable: GlobalManager.typoListNotifier,
+            builder: (context, list, _) {
+              return Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: list.map((item) {
+                  return Chip(
+                    label: Text(item),
+                    deleteIcon: const Icon(Icons.cancel, size: 18),
+                    onDeleted: () {
+                      final newList = List<String>.from(list)..remove(item);
+                      GlobalManager.saveTypoList(newList);
+                    },
+                  );
+                }).toList(),
+              );
+            },
+          ),
+          const SizedBox(height: 20),
+          // 👆 錯字記憶庫 UI 結束 👆
           const Text(
             "預設與會者 (常用名單)",
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -4235,7 +4473,76 @@ class _SettingsPageState extends State<SettingsPage> {
                   .toList(),
             ),
           ),
-          const SizedBox(height: 40),
+          const SizedBox(height: 20),
+          // 👇 💡 錯字記憶庫 UI 👇
+          const Text("錯字記憶庫 (AI 智能校正)",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text("當 AI 常把特定發音聽錯時，可設定強制取代 (例如: 頻狗 ➡️ 蘋果)",
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _typoWrongController,
+                  decoration: const InputDecoration(
+                      labelText: "常聽錯的字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Icon(Icons.arrow_forward)),
+              Expanded(
+                child: TextField(
+                  controller: _typoCorrectController,
+                  decoration: const InputDecoration(
+                      labelText: "正確字",
+                      border: OutlineInputBorder(),
+                      isDense: true),
+                ),
+              ),
+              IconButton(
+                icon:
+                    const Icon(Icons.add_circle, color: Colors.blue, size: 36),
+                onPressed: () {
+                  final w = _typoWrongController.text.trim();
+                  final c = _typoCorrectController.text.trim();
+                  if (w.isNotEmpty && c.isNotEmpty) {
+                    final list =
+                        List<String>.from(GlobalManager.typoListNotifier.value);
+                    list.add("$w ➡️ $c");
+                    GlobalManager.saveTypoList(list);
+                    _typoWrongController.clear();
+                    _typoCorrectController.clear();
+                  }
+                },
+              )
+            ],
+          ),
+          const SizedBox(height: 8),
+          ValueListenableBuilder<List<String>>(
+            valueListenable: GlobalManager.typoListNotifier,
+            builder: (context, list, _) {
+              return Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: list.map((item) {
+                  return Chip(
+                    label: Text(item),
+                    deleteIcon: const Icon(Icons.cancel, size: 18),
+                    onDeleted: () {
+                      final newList = List<String>.from(list)..remove(item);
+                      GlobalManager.saveTypoList(newList);
+                    },
+                  );
+                }).toList(),
+              );
+            },
+          ),
+          // 👆 💡 錯字記憶庫 UI 結束 👆
+          const SizedBox(height: 30),
         ],
       ),
     );
