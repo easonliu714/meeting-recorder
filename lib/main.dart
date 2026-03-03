@@ -24,7 +24,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 import 'package:url_launcher/url_launcher.dart';
 
-const String APP_VERSION = "1.0.57"; // 💡 修改Deepgram 設定git add.
+const String APP_VERSION = "1.0.58"; // 💡 修改Gemini提示詞優化零碎句，新增單句重聽功能
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1094,12 +1094,11 @@ class GlobalManager {
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【講者辨識與人名強制校正】：將 Speaker 0 等代號替換為真實人名。若對話內文中出現任何「發音相近的人名」，請務必與「預期與會者名單」進行拼音比對，並強制校正為正確人名！
-              2. 【強制字典修正】：請修正錯字。
-              3. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
-              4. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
+              1. 【修復碎裂與人名校正】：將 Speaker 0 等代號替換為真實人名。STT 引擎會將句子切得太碎，並在中文字之間產生不正常的空格（如「我 們 今 天」）。請務必「清除所有中文字之間的空格」，將過度碎裂的短句合併成語意通順的長句！若有發音相近人名請強制校正。
+              2. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
+              3. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
               $typoInstruction   // 💡 注入錯字記憶庫指令
-              5. 嚴格保留原始 [秒數] 填入 startTime。
+              4. 嚴格保留原始 [秒數] 填入 startTime。
               
               回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)。
               """;
@@ -1369,12 +1368,11 @@ class GlobalManager {
         $currentChunk
         ---
         請扮演極度嚴格的「會議記錄淨化員」，執行以下「校正」任務：
-        1. 【終極幻覺過濾】：請掃描並直接「整句刪除」STT 幻覺垃圾訊息。若發現與「會議全局上下文」毫不相干的外語亂碼或無意義疊字，請直接捨棄該句！
-        2. 參考最新專有詞彙庫：${vocabList.join(', ')}。修正錯字。
-        3. 參考最新與會者名單：${participantList.join(', ')}。根據上下文重新判斷說話者。並請嚴格比對逐字稿內文的發音，將錯誤的人名強制修正為名單內的正確人名。
+        1. 【修復碎裂與幻覺過濾】：請掃描並「整句刪除」毫無意義的外語亂碼幻覺。同時，務必「清除所有中文字之間的不正常空格」，並將過度碎裂的短句合併成流暢的長句。參考詞彙庫：${vocabList.join(', ')}。
+        2. 參考最新與會者名單：${participantList.join(', ')}。根據上下文重新判斷說話者。並請嚴格比對逐字稿內文的發音，將錯誤的人名強制修正為名單內的正確人名。
         $typoInstruction   // 💡 注入錯字記憶庫指令
-        4. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
-        5. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
+        3. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
+        4. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
 
         請回傳格式：包含 speaker, original, phonetic, translation, startTime 的純 JSON 陣列。若全段皆為幻覺，回傳 []。
         """;
@@ -1628,6 +1626,126 @@ class GlobalManager {
       _log("❌ 翻譯流程錯誤: $e");
       note.status = NoteStatus.failed;
       note.summary.insert(0, "翻譯失敗: $e");
+      note.currentStep = '';
+      await saveNote(note);
+    }
+  }
+
+  // 👇 💡 新增：局部語言重聽功能 👇
+  static Future<void> reListenSegment(
+      MeetingNote note, int targetIndex, String targetLang) async {
+    note.status = NoteStatus.processing;
+    note.currentStep = "正在局部重聽 (指定語系)...";
+    _log("🔄 狀態更新: ${note.currentStep}");
+    await saveNote(note);
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String externalKey = prefs.getString('deepgram_api_key') ?? '';
+      if (externalKey.isEmpty) throw Exception("請先設定 Deepgram API Key");
+
+      double targetTime = note.transcript[targetIndex].startTime;
+      double windowStart = max(0.0, targetTime - 5.0);
+      double windowEnd = targetTime + 45.0; // 💡 往後涵蓋 45 秒的對話區間
+
+      // 1. 找出這個時間點對應的是哪一個實體音檔 (Part)
+      List<String> targetParts =
+          note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
+      double currentOffset = 0.0;
+      File? targetFile;
+      double partOffset = 0.0;
+      double partDuration = 0.0;
+
+      for (String p in targetParts) {
+        File f = await getActualFile(p);
+        if (!await f.exists()) continue;
+        final tempPlayer = AudioPlayer();
+        await tempPlayer.setSource(DeviceFileSource(f.path));
+        final durationObj = await tempPlayer.getDuration();
+        await tempPlayer.dispose();
+        double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
+
+        if (targetTime >= currentOffset &&
+            targetTime <= currentOffset + partSecs) {
+          targetFile = f;
+          partOffset = currentOffset;
+          partDuration = partSecs;
+          break;
+        }
+        currentOffset += partSecs;
+      }
+
+      if (targetFile == null) throw Exception("找不到對應的音檔片段");
+
+      // 2. 將該檔案送給 Deepgram 重新以指定語系辨識
+      var utterances = await DeepgramApi.transcribeAudio(
+          externalKey, targetFile, targetLang);
+      await UsageTracker.addDeepgramSeconds(partDuration); // 紀錄成本
+
+      // 3. 過濾出符合時間區間的句子
+      List<dynamic> filteredUtterances = [];
+      for (var u in utterances) {
+        double start = (u['start'] as num).toDouble() + partOffset;
+        if (start >= windowStart && start <= windowEnd) {
+          filteredUtterances.add({
+            'start': start,
+            'text': u['transcript'],
+            'speaker': 'Speaker ${u['speaker']}'
+          });
+        }
+      }
+
+      if (filteredUtterances.isEmpty) throw Exception("該區段沒有辨識出任何聲音");
+
+      StringBuffer sb = StringBuffer();
+      for (var u in filteredUtterances) {
+        sb.writeln("[${u['start']}秒] ${u['speaker']}: ${u['text']}");
+      }
+
+      // 4. 交給 Gemini 進行淨化、合併與翻譯
+      String prompt = """
+      這是一段局部的重新聽寫稿（目標語系：$targetLang）。
+      請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
+      1. 【修復過度碎裂】：STT 引擎可能會將一句話切得太碎，或在中文字之間產生不正常的空格（如「我 們 今 天」）。請務必「清除所有中文字之間的空格」，並將過度碎裂的短句合併成語意通順的長句！
+      2. 【語言與翻譯】：如果原文是外語，放 original 欄位，羅馬拼音放 phonetic，繁體中文翻譯放 translation。中文則其餘留空。
+      3. 嚴格保留原始 [秒數] 填入 startTime。
+
+      以下是原始 STT 內容：
+      ---
+      $sb
+      ---
+      回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)。不要加上 ```json 標籤。
+      """;
+
+      final apiKeys = await getApiKeys();
+      String strategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
+      List<String> modelsToTry = strategy == 'pro'
+          ? ['gemini-pro-latest', 'gemini-2.5-pro']
+          : ['gemini-flash-latest', 'gemini-2.5-flash'];
+
+      final response =
+          await GeminiRestApi.generateTextOnly(apiKeys, modelsToTry, prompt);
+      final List<dynamic> parsedList = _parseJsonList(response);
+      List<TranscriptItem> newItems =
+          parsedList.map((e) => TranscriptItem.fromJson(e)).toList();
+
+      if (newItems.isNotEmpty) {
+        // 5. 拔除舊區間的句子，塞入新翻譯的句子
+        note.transcript.removeWhere((item) =>
+            item.startTime >= windowStart && item.startTime <= windowEnd);
+        note.transcript.addAll(newItems);
+        note.transcript.sort((a, b) => a.startTime.compareTo(b.startTime));
+      } else {
+        throw Exception("AI 處理後回傳空白");
+      }
+
+      note.status = NoteStatus.success;
+      note.currentStep = '';
+      await saveNote(note);
+    } catch (e) {
+      _log("❌ 局部重聽失敗: $e");
+      note.status = NoteStatus.failed;
+      note.summary.insert(0, "局部重聽失敗: $e");
       note.currentStep = '';
       await saveNote(note);
     }
@@ -3190,6 +3308,70 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                             child: const Text("儲存"),
                           ),
                         ],
+                      ),
+                    );
+                  },
+                ),
+                // 👇 💡 新增：局部語言重聽按鈕 👇
+                IconButton(
+                  icon: const Icon(Icons.language, color: Colors.blue),
+                  tooltip: "局部外語重聽 (解決漏字或外語辨識錯誤)",
+                  onPressed: () {
+                    FocusScope.of(context).unfocus(); // 收起鍵盤
+                    String selectedLang = 'ja';
+                    showDialog(
+                      context: context,
+                      builder: (ctx) => StatefulBuilder(
+                        builder: (context, setStateSB) => AlertDialog(
+                          title: const Text("🎧 局部語言重聽"),
+                          content: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                  "若此段落有漏字或外語辨識錯誤，可指定語系重新聽寫此段落 (往後涵蓋約 45 秒)。",
+                                  style: TextStyle(fontSize: 13)),
+                              const SizedBox(height: 16),
+                              DropdownButton<String>(
+                                isExpanded: true,
+                                value: selectedLang,
+                                items: const [
+                                  DropdownMenuItem(
+                                      value: 'en', child: Text("英文 (English)")),
+                                  DropdownMenuItem(
+                                      value: 'ja', child: Text("日文 (日本語)")),
+                                  DropdownMenuItem(
+                                      value: 'ko', child: Text("韓文 (한국어)")),
+                                  DropdownMenuItem(
+                                      value: 'zh', child: Text("繁體中文 (zh-TW)")),
+                                  DropdownMenuItem(
+                                      value: 'auto',
+                                      child: Text("自動偵測 (Auto)")),
+                                ],
+                                onChanged: (val) {
+                                  setStateSB(() => selectedLang = val!);
+                                },
+                              ),
+                            ],
+                          ),
+                          actions: [
+                            TextButton(
+                                onPressed: () => Navigator.pop(ctx),
+                                child: const Text("取消")),
+                            FilledButton(
+                              onPressed: () {
+                                Navigator.pop(ctx);
+                                Navigator.pop(context); // 關閉編輯對話框
+                                GlobalManager.reListenSegment(
+                                        _note, index, selectedLang)
+                                    .then((_) {
+                                  if (mounted) _reloadNote();
+                                });
+                              },
+                              child: const Text("開始重聽"),
+                            ),
+                          ],
+                        ),
                       ),
                     );
                   },
