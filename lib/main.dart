@@ -24,7 +24,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 import 'package:url_launcher/url_launcher.dart';
 
-const String APP_VERSION = "1.0.59"; // 新增：編輯摘要與任務,局部語言重聽功能,專屬的字典管理頁面入口
+const String APP_VERSION = "1.0.60"; // 💡 延伸 ForegroundTask 到 AI 分析階段，徹底防斷網
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -52,7 +52,6 @@ class MyTaskHandler extends TaskHandler {
   Future<void> onRepeatEvent(DateTime timestamp, SendPort? sendPort) async {}
 }
 
-// --- 結構化多語系逐字稿模型 ---
 class TranscriptItem {
   String speaker;
   String original;
@@ -161,7 +160,7 @@ class MeetingNote {
   String title;
   DateTime date;
   String audioPath;
-  List<String> audioParts; // 1.0.46 修改：支援多段錄音合併
+  List<String> audioParts;
   List<String> summary;
   List<TaskItem> tasks;
   List<TranscriptItem> transcript;
@@ -206,7 +205,6 @@ class MeetingNote {
       title: json['title'],
       date: DateTime.parse(json['date']),
       audioPath: json['audioPath'] ?? '',
-      // 👇 1.0.46 修改開始：向下相容舊資料 👇
       audioParts: (json['audioParts'] as List<dynamic>?)
               ?.map((e) => e.toString())
               .toList() ??
@@ -242,7 +240,6 @@ String _maskKey(String key) {
   return "...${key.substring(key.length - 4)}";
 }
 
-// 使用量追蹤器
 class UsageTracker {
   static DateTime? firstUseDate;
   static double groqAudioSeconds = 0;
@@ -253,9 +250,7 @@ class UsageTracker {
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     String? dateStr = prefs.getString('usage_first_date');
-    if (dateStr != null)
-      firstUseDate =
-          DateTime.tryParse(dateStr); // ✅ 必須先確認 dateStr 不是 null，才能進行轉換
+    if (dateStr != null) firstUseDate = DateTime.tryParse(dateStr);
     if (firstUseDate == null) {
       firstUseDate = DateTime.now();
       await prefs.setString(
@@ -271,13 +266,13 @@ class UsageTracker {
     groqAudioSeconds += seconds;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('usage_groq_seconds', groqAudioSeconds);
-  } // 💡 儲存 Groq
+  }
 
   static Future<void> addDeepgramSeconds(double seconds) async {
     deepgramAudioSeconds += seconds;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('usage_deepgram_seconds', deepgramAudioSeconds);
-  } // 💡 儲存 Deepgram
+  }
 
   static Future<void> addGeminiTextRequest() async {
     geminiTextRequests += 1;
@@ -322,7 +317,7 @@ class GroqApi {
         break;
     }
 
-    int retries = 3; // 💡 允許網路瞬斷重試 3 次
+    int retries = 3;
     while (retries > 0) {
       try {
         if (retries == 3)
@@ -355,8 +350,8 @@ class GroqApi {
         }
       } catch (e) {
         retries--;
-        if (retries == 0) rethrow; // 3次都失敗才真的放棄
-        await Future.delayed(const Duration(seconds: 5)); // 等待 5 秒後重試
+        if (retries == 0) rethrow;
+        await Future.delayed(const Duration(seconds: 5));
       }
     }
     return [];
@@ -369,14 +364,13 @@ class GroqApi {
     }).timeout(const Duration(seconds: 15));
     if (response.statusCode != 200)
       throw Exception('Groq API 測試失敗 (${response.statusCode})');
-  } // Groq API 測試
+  }
 }
 
 class DeepgramApi {
   static Future<List<dynamic>> transcribeAudio(
       String apiKey, File audioFile, String sttLanguage) async {
     String langParam = sttLanguage == 'zh' ? 'zh-TW' : sttLanguage;
-    // 💡 加入 filler_words=true 強制聽寫所有發音細節
     String urlStr =
         'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true&punctuate=true&filler_words=true';
     if (langParam == 'auto')
@@ -409,7 +403,7 @@ class DeepgramApi {
     }).timeout(const Duration(seconds: 15));
     if (response.statusCode != 200)
       throw Exception('Deepgram API 測試失敗 (${response.statusCode})');
-  } // Deepgram API 測試
+  }
 }
 
 class GeminiRestApi {
@@ -419,7 +413,7 @@ class GeminiRestApi {
       String apiKey, File file, String mimeType, String displayName) async {
     int fileSize = await file.length();
     _log(
-        '準備上傳音檔 (使用 Key ${_maskKey(apiKey)}): $displayName (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)');
+        '準備上傳音檔: $displayName (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)');
     final initUrl = Uri.parse(
         '$_baseUrl/upload/v1beta/files?key=$apiKey&uploadType=resumable');
     final metadata = jsonEncode({
@@ -441,7 +435,6 @@ class GeminiRestApi {
     final uploadUrl = initResponse.headers['x-goog-upload-url'];
     if (uploadUrl == null) throw Exception('Failed to retrieve upload URL');
 
-    _log('開始傳送檔案資料...');
     final fileBytes = await file.readAsBytes();
     final uploadResponse = await http.put(Uri.parse(uploadUrl),
         headers: {
@@ -454,7 +447,6 @@ class GeminiRestApi {
     if (uploadResponse.statusCode != 200)
       throw Exception('File transfer failed: ${uploadResponse.body}');
     final responseData = jsonDecode(uploadResponse.body);
-    _log('✅ 上傳成功! File URI: ${responseData['file']['uri']}');
     return responseData['file'];
   }
 
@@ -488,7 +480,6 @@ class GeminiRestApi {
       int maxRetries = 4;
 
       while (retryCount < maxRetries) {
-        if (retryCount == 0) _log('發送請求至模型: $currentModel');
         try {
           final response = await http
               .post(url,
@@ -514,15 +505,12 @@ class GeminiRestApi {
           if (response.statusCode == 429) {
             if (response.body.contains('RESOURCE_EXHAUSTED'))
               throw Exception("RESOURCE_EXHAUSTED");
-            _log("⏳ API 請求過於頻繁 (429)，系統自動等待 15 秒後重試..."); // 💡 補上 Log
+            _log("⏳ API 請求頻繁，等待 15 秒...");
             await Future.delayed(const Duration(seconds: 15));
             retryCount++;
             continue;
           }
-          if (response.statusCode == 404 || response.statusCode == 400) {
-            _log("⚠️ 模型 $currentModel 不可用，切換備援模型...");
-            break;
-          }
+          if (response.statusCode == 404 || response.statusCode == 400) break;
           if (response.statusCode != 200)
             throw Exception('Generate failed: ${response.body}');
 
@@ -533,8 +521,7 @@ class GeminiRestApi {
           if (e.toString().contains("RESOURCE_EXHAUSTED")) rethrow;
           if (retryCount < maxRetries - 1 &&
               !e.toString().contains('Generate failed')) {
-            _log(
-                "⚠️ 網路不穩或連線異常 ($e)，短暫等待 10 秒後重試 (${retryCount + 1}/$maxRetries)...");
+            _log("⚠️ 網路異常 ($e)，短暫等待後重試 (${retryCount + 1}/$maxRetries)...");
             await Future.delayed(const Duration(seconds: 10));
             retryCount++;
             continue;
@@ -579,8 +566,7 @@ class GeminiRestApi {
             if (response.statusCode == 429) {
               if (response.body.contains('RESOURCE_EXHAUSTED') ||
                   response.body.contains('Quota exceeded')) {
-                _log(
-                    "⚠️ Key ${_maskKey(currentKey)} 在 $currentModel 額度已滿，無縫切換下一把 Key...");
+                _log("⚠️ Key ${_maskKey(currentKey)} 額度已滿，切換下一把...");
                 break;
               } else {
                 if (onWait != null) onWait("請求過快，短暫休眠 15 秒...");
@@ -590,10 +576,13 @@ class GeminiRestApi {
                 continue;
               }
             }
+
+            // 💡 1.0.60 確保括號正確閉合
             if (response.statusCode == 404 || response.statusCode == 400) {
               _log("⚠️ 模型 $currentModel 不可用，切換備援模型...");
               break;
             }
+
             if (response.statusCode != 200)
               throw Exception('Generate failed: ${response.body}');
 
@@ -613,12 +602,11 @@ class GeminiRestApi {
         }
       }
     }
-    throw Exception('純文字分析：所有 API Key 與模型均已耗盡，請稍後再試。');
+    throw Exception('所有 API Key 均已耗盡，請稍後再試。');
   }
 
   static Future<List<String>> getAvailableModels(String apiKey) async {
     final url = Uri.parse('$_baseUrl/v1beta/models?key=$apiKey');
-    _log('正在測試 API Key 狀態...');
     final response = await http.get(url);
     if (response.statusCode != 200)
       throw Exception('API 測試失敗 (${response.statusCode})');
@@ -633,7 +621,6 @@ class GeminiRestApi {
           availableModels.add(name);
       }
     }
-    _log('✅ API Key 測試成功');
     return availableModels;
   }
 }
@@ -693,7 +680,6 @@ class GlobalManager {
     await loadNotes();
   }
 
-  // 💡 儲存錯字清單的方法
   static Future<void> saveTypoList(List<String> list) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('typo_list', list);
@@ -713,9 +699,7 @@ class GlobalManager {
           return b.date.compareTo(a.date);
         });
         notesNotifier.value = loaded;
-      } catch (e) {
-        print("Load error: $e");
-      }
+      } catch (e) {}
     }
   }
 
@@ -787,10 +771,7 @@ class GlobalManager {
       if (target.id.isNotEmpty) {
         try {
           final f = await getActualFile(target.audioPath);
-          if (await f.exists()) {
-            await f.delete();
-            _log("已徹底刪除機密音檔: ${f.path}");
-          }
+          if (await f.exists()) await f.delete();
           for (var p in target.audioParts) {
             final pf = await getActualFile(p);
             if (await pf.exists()) await pf.delete();
@@ -812,16 +793,37 @@ class GlobalManager {
     return File('${dir.path}/$fileName');
   }
 
+  // 💡 1.0.60 核心：確保 AI 處理期間 ForegroundService 持續運作，阻擋系統斷網
+  static Future<void> _updateForegroundTask(String text) async {
+    if (await FlutterForegroundTask.isRunningService) {
+      FlutterForegroundTask.updateService(
+          notificationTitle: 'AI 處理中 (確保網路連線)', notificationText: text);
+    } else {
+      await FlutterForegroundTask.startService(
+          notificationTitle: 'AI 處理中 (確保網路連線)',
+          notificationText: text,
+          callback: startCallback);
+    }
+  }
+
+  static Future<void> _stopForegroundTaskIfNotRecording() async {
+    if (!isRecordingNotifier.value) {
+      await FlutterForegroundTask.stopService();
+    }
+  }
+
   static Future<void> analyzeNote(MeetingNote note) async {
-    await WakelockPlus.enable(); // 💡 確保分析時防休眠
+    await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "準備讀取音檔...";
     _log("🔄 狀態更新: ${note.currentStep}");
+    await _updateForegroundTask(note.currentStep); // 💡 通知系統保持網路
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
     final List<String> apiKeys = await getApiKeys();
-    String strategy = prefs.getString('analysis_strategy') ?? 'deepgram_gemini';
+    String strategy =
+        prefs.getString('analysis_strategy') ?? 'flash'; // 💡 預設改為 flash
     final String groqKey = prefs.getString('groq_api_key') ?? '';
     final String sttLanguage = prefs.getString('stt_language') ?? 'zh';
     final List<String> vocabList = vocabListNotifier.value;
@@ -837,9 +839,6 @@ class GlobalManager {
       double globalOffsetSeconds = 0.0;
       List<dynamic> allWhisperSegments = [];
 
-      // ==========================================
-      // 🥇 雙引擎模式 (Groq 或 Deepgram -> 全局摘要 -> 局部淨化)
-      // ==========================================
       if (strategy == 'groq_gemini' || strategy == 'deepgram_gemini') {
         final bool isDeepgram = strategy == 'deepgram_gemini';
         final String externalKey =
@@ -858,32 +857,32 @@ class GlobalManager {
           double partSecs = (durationObj?.inMilliseconds ?? 0) / 1000.0;
 
           if (!isDeepgram && partFile.lengthSync() / (1024 * 1024) >= 25.0)
-            throw Exception("單一音檔超過 25MB 限制，Groq 無法處理。");
+            throw Exception("音檔過大，Groq 無法處理。");
 
           note.currentStep =
               "${isDeepgram ? 'Deepgram' : 'Groq'} 聽寫中 (段落 ${i + 1}/${targetParts.length})...";
+          await _updateForegroundTask(note.currentStep);
           await saveNote(note);
 
           try {
             if (isDeepgram) {
               var utterances = await DeepgramApi.transcribeAudio(
                   externalKey, partFile, sttLanguage);
-              await UsageTracker.addDeepgramSeconds(
-                  partSecs); // 💡 記錄 Deepgram 成本
+              await UsageTracker.addDeepgramSeconds(partSecs);
               for (var u in utterances) {
                 allWhisperSegments.add({
                   'start': (u['start'] as num).toDouble() + globalOffsetSeconds,
                   'text': u['transcript'],
                   'speaker': 'Speaker ${u['speaker']}'
                 });
-              } // Deepgram 原生講者標籤
+              }
             } else {
               var segments = await GroqApi.transcribeAudio(
                   externalKey, partFile, partSecs, sttLanguage, vocabList);
               for (var seg in segments) {
                 seg['start'] =
                     (seg['start'] as num).toDouble() + globalOffsetSeconds;
-                seg['speaker'] = 'System'; // Groq 無講者標籤
+                seg['speaker'] = 'System';
                 allWhisperSegments.add(seg);
               }
             }
@@ -903,9 +902,9 @@ class GlobalManager {
           note.transcript = rawTranscript;
           await saveNote(note);
 
-          // 👇 階段一：生成全局摘要 (加上防斷損長度限制) 👇
           note.currentStep = "Gemini 全局摘要生成中...";
           _log("🔄 狀態更新: ${note.currentStep}");
+          await _updateForegroundTask(note.currentStep);
           await saveNote(note);
 
           StringBuffer fullRawText = StringBuffer();
@@ -915,7 +914,7 @@ class GlobalManager {
           }
 
           String summaryPrompt = """
-          這是一份由外部語音系統轉錄的會議原始逐字稿（可能包含錯字或環境雜音）：
+          這是一份會議原始逐字稿（可能包含錯字或環境雜音）：
           ---
           $fullRawText
           ---
@@ -929,16 +928,16 @@ class GlobalManager {
             "sections": [{"title": "段落標題", "startTime": 0, "endTime": 120}]
           }
           注意：
-          - tasks (待辦事項): 仔細提取所有「後續行動」或「未來規劃」。如果完全沒有，請填入 [{"description": "無待辦事項", "assignee": "-", "dueDate": "-"}]。
-          - sections (會議段落): 請將會議劃分為 5 到 8 個階段，startTime 與 endTime 必須是純數字秒數。
-          不要加上 ```json 標籤，直接以 { 開始。
+          - tasks: 仔細提取所有「後續行動」。如果完全沒有，請填入 [{"description": "無待辦事項", "assignee": "-", "dueDate": "-"}]。
+          - sections: startTime 與 endTime 必須是純數字秒數。
+          直接以 { 開始。
           """;
 
           try {
             final summaryResponse = await GeminiRestApi.generateTextOnly(
                 apiKeys, modelsToTry, summaryPrompt, onWait: (msg) async {
               note.currentStep = "全局摘要生成中 - $msg";
-              _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
+              await _updateForegroundTask(note.currentStep);
               await saveNote(note);
             });
             final overviewJson = _parseJson(summaryResponse);
@@ -961,7 +960,6 @@ class GlobalManager {
             note.summary = ["基於原始逐字稿摘要失敗，將在淨化後重試。"];
           }
 
-          // 👇 階段二：帶入上下文進行講者辨識與錯字淨化 👇
           List<TranscriptItem> fullTranscript = [];
           StringBuffer currentChunk = StringBuffer();
           int batchSize = 150;
@@ -986,32 +984,29 @@ class GlobalManager {
               note.currentStep =
                   "Gemini 講者辨識與淨化 ($chunkCount/$totalBatches)...";
               _log("🔄 狀態更新: ${note.currentStep}");
+              await _updateForegroundTask(note.currentStep);
               await saveNote(note);
 
               String textPrompt = """
               【會議全局上下文】：$contextInfo
               專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
-              以下是外部 STT 引擎產生的純文字片段（帶有精準時間戳與原始講者代號）：
+              以下是外部 STT 引擎產生的純文字片段：
               ---
               $currentChunk
               ---
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-              1. 【修復碎裂與人名校正】：將Speaker 0 等代號替換為真實人名。STT 引擎可能會將句子切得太碎，並在中文字之間產生不正常的空格（如「我 們 今 天」）。請務必「清除所有中文字之間的空格」將過度碎裂的短句合併成語意通順的長句！若有發音相近人名請強制校正。
+              1. 【修復碎裂與人名校正】：將代號替換為真實人名。STT 引擎可能會切得太碎或產生空格。務必「清除所有中文字之間的空格」，將過度碎裂的短句合併成語意通順的長句！若有發音相近人名請強制校正。
               2. 【強制字典修正】：請修正錯字。
-              3. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
-              4. 刪除與上下文毫無關聯的外語幻覺與無意義疊字。
+              3. 【語言與翻譯】：外語放 original，羅馬拼音放 phonetic，繁體翻譯放 translation。中文其餘留空。
+              4. 刪除與上下文毫無關聯的外語幻覺。
               $typoInstruction
               5. 嚴格保留原始 [秒數] 填入 startTime。
-              回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。
+              回傳純 JSON 陣列。
               """;
 
               try {
                 final chunkResponse = await GeminiRestApi.generateTextOnly(
-                    apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
-                  note.currentStep = "講者淨化 ($chunkCount/$totalBatches) - $msg";
-                  _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
-                  await saveNote(note);
-                });
+                    apiKeys, modelsToTry, textPrompt);
                 final List<dynamic> parsedList = _parseJsonList(chunkResponse);
                 if (parsedList.isNotEmpty) {
                   fullTranscript.addAll(parsedList
@@ -1020,7 +1015,7 @@ class GlobalManager {
                 } else
                   throw Exception("回傳了空陣列");
               } catch (e) {
-                _log("⚠️ 第 $chunkCount 批次講者辨識失敗，保留原始聽寫: $e");
+                _log("⚠️ 淨化失敗: $e");
                 fullTranscript.addAll(currentBatchSegments
                     .map((s) => TranscriptItem(
                         speaker: s['speaker'],
@@ -1040,9 +1035,6 @@ class GlobalManager {
         }
       }
 
-      // ==========================================
-      // 🥈 原生語音處理模式 (純 Gemini 備案)
-      // ==========================================
       if (strategy != 'groq_gemini') {
         modelsToTry = strategy == 'pro'
             ? ['gemini-pro-latest', 'gemini-2.5-pro']
@@ -1063,6 +1055,7 @@ class GlobalManager {
 
         note.currentStep = "上傳大型音訊檔案中...";
         _log("🔄 狀態更新: ${note.currentStep}");
+        await _updateForegroundTask(note.currentStep);
         await saveNote(note);
 
         var fileInfo = await GeminiRestApi.uploadFile(
@@ -1073,6 +1066,7 @@ class GlobalManager {
 
         note.currentStep = "AI 正在分析會議摘要...";
         _log("🔄 狀態更新: ${note.currentStep}");
+        await _updateForegroundTask(note.currentStep);
         await saveNote(note);
 
         String overviewPrompt = """
@@ -1115,7 +1109,7 @@ class GlobalManager {
                   .toList() ??
               [];
         } catch (e) {
-          _log("摘要產生遇到問題: $e，將繼續嘗試逐字稿聽打。");
+          _log("摘要產生遇到問題: $e");
         }
 
         List<TranscriptItem> fullTranscript = [];
@@ -1125,10 +1119,10 @@ class GlobalManager {
             ? "【歷史錯字替換】：請嚴格參考此對應表(錯字 ➡️ 正確字)：${typoList.join(' , ')}"
             : "";
 
-        int emptyCount = 0;
         for (int i = 0; i < maxChunks; i++) {
           note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
           _log("🔄 狀態更新: ${note.currentStep}");
+          await _updateForegroundTask(note.currentStep);
           await saveNote(note);
 
           double chunkStart = (i * chunkSize).toDouble();
@@ -1142,12 +1136,12 @@ class GlobalManager {
           【會議全局上下文】：$contextInfo
           專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
           【極度重要限制】：
-          1. 絕對不可從 0 秒開始聽打！你必須精準從第 $chunkStart 秒的聲音開始。不要重複前面的內容！
-          2. 如果這個片段 ($chunkStart 秒 ~ $chunkEnd 秒) 裡面是「靜音」、「無人說話」或「純環境雜音」，請直接回傳空陣列 []，絕對不要憑空捏造對話！
+          1. 絕對不可從 0 秒開始聽打！精準從第 $chunkStart 秒開始。
+          2. 如果片段裡面是「靜音」，請直接回傳空陣列 []。
           3. 【強制短句斷點】：單一句子長度超過 10 秒必須斷開。
           4. 【講者辨識】：請根據聲音特徵與「全局上下文」，精準標註講者。
           $typoInstruction
-          請回傳純 JSON 陣列 (包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。
+          請回傳純 JSON 陣列。
           """;
 
           bool chunkSuccess = false;
@@ -1179,23 +1173,14 @@ class GlobalManager {
                 if (currentKeyIndex >= apiKeys.length)
                   throw Exception("所有 API Key 均已耗盡！");
                 lockedKey = apiKeys[currentKeyIndex];
-                _log("🔄 額度滿載！無縫切換 Key ${_maskKey(lockedKey)}，正在重新上傳音檔...");
-
-                note.currentStep = "額度切換，重傳音檔中...";
-                _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
-                await saveNote(note);
-
+                _log("🔄 額度滿載！無縫切換 Key，重傳音檔中...");
                 fileInfo = await GeminiRestApi.uploadFile(
                     lockedKey, audioFile, 'audio/mp4', note.title);
                 fileUri = fileInfo['uri'];
                 await GeminiRestApi.waitForFileActive(
                     lockedKey, fileInfo['name'].split('/').last);
-
-                note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
-                _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
-                await saveNote(note);
               } else {
-                _log("分段 $i 最終分析失敗: $e");
+                _log("分段 $i 失敗: $e");
                 chunkSuccess = true;
               }
             }
@@ -1214,27 +1199,28 @@ class GlobalManager {
       note.currentStep = '';
       await saveNote(note);
     } finally {
-      await WakelockPlus.disable(); // 💡 解除休眠鎖
+      await WakelockPlus.disable();
+      await _stopForegroundTaskIfNotRecording(); // 💡 分析完畢，解除背景鎖
     }
   }
 
   static Future<void> reCalibrateTranscript(MeetingNote note) async {
-    await WakelockPlus.enable(); // 💡 確保分析時防休眠
+    await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "準備校正逐字稿...";
     _log("🔄 狀態更新: ${note.currentStep}");
+    await _updateForegroundTask(note.currentStep);
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
     final List<String> apiKeys = await getApiKeys();
-    final String strategy =
-        prefs.getString('analysis_strategy') ?? 'groq_gemini';
+    final String strategy = prefs.getString('analysis_strategy') ?? 'flash';
     final List<String> vocabList = vocabListNotifier.value;
     final List<String> participantList = participantListNotifier.value;
 
     try {
       if (apiKeys.isEmpty) throw Exception("請先設定 API Key");
-      if (note.transcript.isEmpty) throw Exception("沒有可用的逐字稿，請選擇「徹底語音重聽」。");
+      if (note.transcript.isEmpty) throw Exception("沒有可用的逐字稿。");
 
       List<String> modelsToTry = strategy == 'pro'
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
@@ -1256,6 +1242,7 @@ class GlobalManager {
 
         note.currentStep = "AI 正在校正錯字與講者 (${i + 1}/$totalBatches)...";
         _log("🔄 狀態更新: ${note.currentStep}");
+        await _updateForegroundTask(note.currentStep);
         await saveNote(note);
 
         StringBuffer currentChunk = StringBuffer();
@@ -1267,34 +1254,29 @@ class GlobalManager {
         String textPrompt = """
         這是一場會議的局部逐字稿。
         【會議全局上下文】：$contextInfo
-        以下是現有的逐字稿（帶有精準時間戳）：
+        以下是現有的逐字稿：
         ---
         $currentChunk
         ---
         請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
         1. 【修復碎裂與幻覺過濾】：請掃描並「整句刪除」毫無意義的外語亂碼幻覺。同時，務必「清除所有中文字之間的不正常空格」，並將過度碎裂的短句合併成流暢的長句。參考詞彙庫：${vocabList.join(', ')}。
-        2. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意重新判斷說話者。並請嚴格比對逐字稿內文的發音，將錯誤的人名強制修正為名單內的正確人名。
+        2. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意重新判斷說話者。並強制修正人名錯字。
         $typoInstruction
-        3. 【極度重要】：絕對嚴格保留原始括號內的 [秒數]，並填入 startTime 欄位，不可竄改任何時間戳！
-        4. 【語言與翻譯】：如果原文是外語（例如日、韓、英文），請將修正後的外語放 original 欄位，將其「羅馬拼音」放 phonetic 欄位，並將「繁體中文翻譯」放 translation 欄位。如果原文是中文，則 original 放中文，其餘兩欄留空。
-        請回傳純 JSON 陣列(包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。 全段皆為幻覺，回傳 []。
+        3. 【極度重要】：絕對嚴格保留原始括號內的 [秒數] 填入 startTime！
+        4. 【語言與翻譯】：外語放 original，羅馬拼音放 phonetic，翻譯放 translation。中文其餘留空。
+        請回傳純 JSON 陣列。
         """;
 
         try {
           final chunkResponse = await GeminiRestApi.generateTextOnly(
-              apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
-            note.currentStep = "校正進度 (${i + 1}/$totalBatches) - $msg";
-            _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
-            await saveNote(note);
-          });
+              apiKeys, modelsToTry, textPrompt);
           final List<dynamic> parsedList = _parseJsonList(chunkResponse);
           if (parsedList.isNotEmpty) {
             calibratedTranscript.addAll(
                 parsedList.map((e) => TranscriptItem.fromJson(e)).toList());
           }
-          _log("已完成第 ${i + 1}/$totalBatches 批次文字校正。");
         } catch (e) {
-          _log("⚠️ 第 ${i + 1} 批次校正失敗，已為您保留該段的原始內容: $e");
+          _log("⚠️ 校正失敗，保留原始內容: $e");
           calibratedTranscript.addAll(batchItems);
         }
       }
@@ -1304,24 +1286,27 @@ class GlobalManager {
 
       note.currentStep = "正在重整最終摘要...";
       _log("🔄 狀態更新: ${note.currentStep}");
+      await _updateForegroundTask(note.currentStep);
       await saveNote(note);
       await reSummarizeFromTranscript(note);
     } catch (e) {
-      _log("校正流程發生嚴重錯誤: $e");
+      _log("校正發生錯誤: $e");
       note.status = NoteStatus.failed;
       note.summary.insert(0, "校正失敗: $e");
       note.currentStep = '';
       await saveNote(note);
     } finally {
-      await WakelockPlus.disable(); // 💡 解除休眠鎖
+      await WakelockPlus.disable();
+      await _stopForegroundTaskIfNotRecording();
     }
   }
 
   static Future<void> reSummarizeFromTranscript(MeetingNote note) async {
-    await WakelockPlus.enable(); // 💡 防休眠
+    await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "基於最新逐字稿重整摘要...";
     _log("🔄 狀態更新: ${note.currentStep}");
+    await _updateForegroundTask(note.currentStep);
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
@@ -1373,14 +1358,14 @@ class GlobalManager {
         "sections": [{"title": "段落標題", "startTime": 12.5, "endTime": 45.0}]
       }
       3. tasks (待辦事項): 提取所有後續行動。如果完全沒有，請填入 [{"description": "無待辦事項", "assignee": "-", "dueDate": "-"}]。
-      4. sections (會議段落): startTime 與 endTime 必須填寫「純數字的秒數」，絕不可用 MM:SS！
-      請直接回傳純 JSON 格式。不要加上 ```json 標籤，直接以 { 開始。
+      4. sections (會議段落): startTime 與 endTime 必須是純數字秒數。
+      請直接回傳純 JSON 格式。
       """;
 
       final responseText = await GeminiRestApi.generateTextOnly(
           apiKeys, modelsToTry, prompt, onWait: (msg) async {
         note.currentStep = "重整摘要中 - $msg";
-        _log("🔄 狀態更新: ${note.currentStep}");
+        await _updateForegroundTask(note.currentStep);
         await saveNote(note);
       });
 
@@ -1389,7 +1374,7 @@ class GlobalManager {
       var rawSummary = overviewJson['summary'];
       note.summary = rawSummary is List
           ? rawSummary.map((e) => e.toString()).toList()
-          : ["無法生成摘要 (可能是內容過長導致 AI 輸出中斷)"];
+          : ["無法生成摘要"];
       note.tasks = (overviewJson['tasks'] as List<dynamic>?)
               ?.map((e) => TaskItem.fromJson(e))
               .toList() ??
@@ -1414,22 +1399,23 @@ class GlobalManager {
       note.currentStep = '';
       await saveNote(note);
     } finally {
-      await WakelockPlus.disable(); // 💡 解除休眠鎖
+      await WakelockPlus.disable();
+      await _stopForegroundTaskIfNotRecording();
     }
   }
 
   static Future<void> translateTranscript(
       MeetingNote note, String targetLang) async {
-    await WakelockPlus.enable(); // 💡 防休眠
+    await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "準備翻譯逐字稿...";
     _log("🔄 狀態更新: ${note.currentStep}");
+    await _updateForegroundTask(note.currentStep);
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
     final List<String> apiKeys = await getApiKeys();
-    final String strategy =
-        prefs.getString('analysis_strategy') ?? 'groq_gemini';
+    final String strategy = prefs.getString('analysis_strategy') ?? 'flash';
 
     try {
       if (apiKeys.isEmpty) throw Exception("請先設定 API Key");
@@ -1464,6 +1450,7 @@ class GlobalManager {
 
         note.currentStep = "AI 正在翻譯為 $langName (${i + 1}/$totalBatches)...";
         _log("🔄 狀態更新: ${note.currentStep}");
+        await _updateForegroundTask(note.currentStep);
         await saveNote(note);
 
         StringBuffer currentChunk = StringBuffer();
@@ -1483,15 +1470,12 @@ class GlobalManager {
         3. 請將翻譯結果填入 `translation` 欄位。
         4. $phoneticInstruction
         5. 嚴格保留原始 [秒數] 填入 startTime 欄位，說話者填入 speaker 欄位。
-        請直接回傳純 JSON 陣列(包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。
+        請直接回傳純 JSON 陣列。
         """;
 
         try {
           final chunkResponse = await GeminiRestApi.generateTextOnly(
-              apiKeys, modelsToTry, textPrompt, onWait: (msg) async {
-            note.currentStep = "翻譯進度 (${i + 1}/$totalBatches) - $msg";
-            await saveNote(note);
-          });
+              apiKeys, modelsToTry, textPrompt);
           final List<dynamic> parsedList = _parseJsonList(chunkResponse);
           if (parsedList.isNotEmpty) {
             for (var p in parsedList) {
@@ -1506,7 +1490,7 @@ class GlobalManager {
             }
           }
         } catch (e) {
-          _log("⚠️ 第 ${i + 1} 批次翻譯失敗，保留該段原文: $e");
+          _log("⚠️ 第 ${i + 1} 批次翻譯失敗: $e");
         }
       }
 
@@ -1521,17 +1505,18 @@ class GlobalManager {
       note.currentStep = '';
       await saveNote(note);
     } finally {
-      await WakelockPlus.disable(); // 💡 解除休眠鎖
+      await WakelockPlus.disable();
+      await _stopForegroundTaskIfNotRecording();
     }
   }
 
-  // 💡 1.0.59 局部語言重聽功能
   static Future<void> reListenSegment(
       MeetingNote note, int targetIndex, String targetLang) async {
     await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "正在局部重聽 (指定語系)...";
     _log("🔄 狀態更新: ${note.currentStep}");
+    await _updateForegroundTask(note.currentStep);
     await saveNote(note);
 
     try {
@@ -1543,7 +1528,6 @@ class GlobalManager {
       double windowStart = max(0.0, targetTime - 5.0);
       double windowEnd = targetTime + 45.0;
 
-      // 1. 找出這個時間點對應的是哪一個實體音檔 (Part)
       List<String> targetParts =
           note.audioParts.isNotEmpty ? note.audioParts : [note.audioPath];
       double currentOffset = 0.0;
@@ -1572,12 +1556,10 @@ class GlobalManager {
 
       if (targetFile == null) throw Exception("找不到對應的音檔片段");
 
-      // 2. 將該檔案送給 Deepgram 重新以指定語系辨識
       var utterances = await DeepgramApi.transcribeAudio(
           externalKey, targetFile, targetLang);
-      await UsageTracker.addDeepgramSeconds(partDuration); // 紀錄成本
+      await UsageTracker.addDeepgramSeconds(partDuration);
 
-      // 3. 過濾出符合時間區間的句子
       List<dynamic> filteredUtterances = [];
       for (var u in utterances) {
         double start = (u['start'] as num).toDouble() + partOffset;
@@ -1600,7 +1582,7 @@ class GlobalManager {
       String prompt = """
       這是一段局部的重新聽寫稿（目標語系：$targetLang）。
       請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
-      1. 【修復過度碎裂】：STT 引擎可能會將一句話切得太碎，或在中文字之間產生不正常的空格（如「我 們 今 天」）。請務必「清除所有中文字之間的空格」，並將過度碎裂的短句合併成語意通順的長句！
+      1. 【修復過度碎裂】：請務必「清除所有中文字之間的空格」，並將過度碎裂的短句合併成語意通順的長句！
       2. 【語言與翻譯】：如果原文是外語，放 original 欄位，羅馬拼音放 phonetic，繁體中文翻譯放 translation。中文則其餘留空。
       3. 嚴格保留原始 [秒數] 填入 startTime。
 
@@ -1608,11 +1590,11 @@ class GlobalManager {
       ---
       $sb
       ---
-      回傳純 JSON 陣列(包含 speaker, original, phonetic, translation, startTime)，不要加上 ```json 標籤，直接以 [ 開始。
+      回傳純 JSON 陣列。
       """;
 
       final apiKeys = await getApiKeys();
-      String strategy = prefs.getString('analysis_strategy') ?? 'groq_gemini';
+      String strategy = prefs.getString('analysis_strategy') ?? 'flash';
       List<String> modelsToTry = strategy == 'pro'
           ? ['gemini-pro-latest', 'gemini-2.5-pro']
           : ['gemini-flash-latest', 'gemini-2.5-flash'];
@@ -1624,7 +1606,6 @@ class GlobalManager {
           parsedList.map((e) => TranscriptItem.fromJson(e)).toList();
 
       if (newItems.isNotEmpty) {
-        // 5. 拔除舊區間的句子，塞入新翻譯的句子
         note.transcript.removeWhere((item) =>
             item.startTime >= windowStart && item.startTime <= windowEnd);
         note.transcript.addAll(newItems);
@@ -1644,6 +1625,7 @@ class GlobalManager {
       await saveNote(note);
     } finally {
       await WakelockPlus.disable();
+      await _stopForegroundTaskIfNotRecording();
     }
   }
 
@@ -1706,11 +1688,10 @@ class _MainAppShellState extends State<MainAppShell>
   double _lastAmplitude = 0.0;
   int _frozenMicCounter = 0;
   bool _isAppInForeground = true;
-  // 👇 1.0.46 修改：多段暫存與等待狀態 👇
   List<String> _sessionAudioParts = [];
   bool _isWaitingForUserResume = false;
   final List<Widget> pages = [const HomePage(), const SettingsPage()];
-  AppLifecycleState? _lastLifecycleState; // 💡 新增用來防止重複紀錄
+  AppLifecycleState? _lastLifecycleState;
 
   @override
   void initState() {
@@ -1724,7 +1705,7 @@ class _MainAppShellState extends State<MainAppShell>
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'recording_channel',
         channelName: '會議錄音背景服務',
-        channelDescription: '保持麥克風在背景持續錄音不中斷',
+        channelDescription: '保持麥克風與網路在背景持續運作不中斷',
         channelImportance: NotificationChannelImportance.HIGH,
         priority: NotificationPriority.HIGH,
         iconData: const NotificationIconData(
@@ -1753,10 +1734,9 @@ class _MainAppShellState extends State<MainAppShell>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_lastLifecycleState == state) return; // 狀態沒變就不記錄
+    if (_lastLifecycleState == state) return;
     _lastLifecycleState = state;
     setState(() => _isAppInForeground = state == AppLifecycleState.resumed);
-    // 💡 只有在「錄音進行中」才寫入日誌，保持除錯畫面乾淨
     if (GlobalManager.isRecordingNotifier.value) {
       if (state == AppLifecycleState.resumed)
         GlobalManager.addLog("📱 [生命週期] APP 回到前景 (Resumed)");
@@ -1807,25 +1787,22 @@ class _MainAppShellState extends State<MainAppShell>
 
       _isSystemInterrupted = false;
       _deadMicCounter = 0;
-      _sessionAudioParts = []; // 💡 清空準備多段錄音
+      _sessionAudioParts = [];
 
       await audioRecorder.start(
-        const RecordConfig(
-          encoder: AudioEncoder.aacLc,
-          bitRate: 32000,
-          sampleRate: 16000,
-          numChannels: 1,
-          autoGain: true, // 💡 解封印！開啟硬體音量自動增益 (遠處人聲自動放大)
-          echoCancel: true, // 💡 1.0.47 啟用防回音
-          noiseSuppress: true, // 💡 1.0.47 啟用環境降噪
-        ),
-        path: path,
-      );
+          const RecordConfig(
+              encoder: AudioEncoder.aacLc,
+              bitRate: 32000,
+              sampleRate: 16000,
+              numChannels: 1,
+              autoGain: true,
+              echoCancel: true,
+              noiseSuppress: true),
+          path: path);
       stopwatch.reset();
       stopwatch.start();
       GlobalManager.addLog("🎙️ 開始錄音 (Part $recordingPart)...");
 
-      // 👇 1.0.46 修改：更換 Timer 以支援「停止盲目重試，等待用戶回歸」邏輯 👇
       timer = Timer.periodic(const Duration(seconds: 1), (timer) async {
         if (!mounted || _isRecovering) return;
         bool isStillRecording = await audioRecorder.isRecording();
@@ -1853,28 +1830,25 @@ class _MainAppShellState extends State<MainAppShell>
             GlobalManager.isRecordingNotifier.value) {
           if (!_isSystemInterrupted) {
             _isSystemInterrupted = true;
-            // 💡 只有在觸發中斷的瞬間，才印出致命的分貝數作為除錯依據
             GlobalManager.addLog(
-                "⚠️ 系統奪取麥克風！觸發時分貝: ${_lastAmplitude.toStringAsFixed(2)} dB (死寂: $_deadMicCounter, 凍結: $_frozenMicCounter)");
+                "⚠️ 系統奪取麥克風！觸發時分貝: ${_lastAmplitude.toStringAsFixed(2)} dB");
             _deadMicCounter = 0;
             _frozenMicCounter = 0;
             _lastAmplitude = 0.0;
             stopwatch.stop();
-            GlobalManager.addLog(
-                "⚠️ 錄音被系統奪取！已暫存 Part $recordingPart。等待您點擊 APP 恢復...");
+            GlobalManager.addLog("⚠️ 錄音被系統奪取！等待您點擊 APP 恢復...");
             FlutterForegroundTask.updateService(
                 notificationTitle: '⚠️ 錄音已暫停',
                 notificationText: '請點擊回到 APP 以繼續錄音');
             try {
               final path = await audioRecorder.stop();
               if (path != null && stopwatch.elapsed.inSeconds >= 2)
-                _sessionAudioParts.add(path); // 💡 將片段加入清單
+                _sessionAudioParts.add(path);
               else if (path != null) File(path).delete().catchError((_) {});
             } catch (e) {}
             recordingPart++;
             _isWaitingForUserResume = true;
           } else {
-            // 💡 只有當用戶回到畫面上時，才嘗試恢復！不再打擾通話或 YT！
             if (_isAppInForeground && _isWaitingForUserResume) {
               _isRecovering = true;
               _isWaitingForUserResume = false;
@@ -1901,7 +1875,6 @@ class _MainAppShellState extends State<MainAppShell>
                   _deadMicCounter = 0;
                   _frozenMicCounter = 0;
                   _lastAmplitude = 0.0;
-                  // 💡 不歸零計時器！讓使用者感覺是一場連續的錄音
                   stopwatch.start();
                   GlobalManager.addLog("✅ 成功接續錄音 (內部 Part $recordingPart)");
                   FlutterForegroundTask.updateService(
@@ -1910,7 +1883,7 @@ class _MainAppShellState extends State<MainAppShell>
                 } else {
                   await audioRecorder.stop();
                   GlobalManager.addLog("❌ 恢復失敗，請確認已關閉通話或其他聲音來源。");
-                  _isWaitingForUserResume = true; // 允許下次重試
+                  _isWaitingForUserResume = true;
                 }
               } catch (e) {
                 _isWaitingForUserResume = true;
@@ -1932,8 +1905,7 @@ class _MainAppShellState extends State<MainAppShell>
 
       GlobalManager.isRecordingNotifier.value = true;
       await WakelockPlus.enable();
-      GlobalManager.addLog(
-          "開始錄音並啟用 Wakelock 防休眠 (32kbps 瘦身模式，確保符合 Groq 大小限制)...");
+      GlobalManager.addLog("開始錄音並啟用 Wakelock 防休眠");
     } else {
       if (mounted)
         ScaffoldMessenger.of(context)
@@ -1949,14 +1921,12 @@ class _MainAppShellState extends State<MainAppShell>
       String title = "會議錄音 Part $recordingPart";
       if (recordingSessionStartTime != null)
         title += " (${DateFormat('HH:mm').format(recordingSessionStartTime!)})";
-      // 👇 1.0.46 修改：改為傳入 List 👇
       createNewNoteAndAnalyze([path], title, date: DateTime.now());
     }
     recordingPart++;
     await startRecording();
   }
 
-  // 👇 1.0.46 修改：收尾多段錄音 👇
   Future<void> stopAndAnalyze({bool manualStop = false}) async {
     timer?.cancel();
     String? path;
@@ -1965,17 +1935,17 @@ class _MainAppShellState extends State<MainAppShell>
     } catch (_) {}
     stopwatch.stop();
     GlobalManager.isRecordingNotifier.value = false;
+
+    // 💡 1.0.60 修正：不急著關閉 ForegroundTask，讓分析階段無縫接手
     await WakelockPlus.disable();
-    if (manualStop) await FlutterForegroundTask.stopService();
 
     if (path != null &&
         !_isSystemInterrupted &&
         stopwatch.elapsed.inSeconds >= 2)
-      _sessionAudioParts.add(path); // 💡 加入最後一個片段
+      _sessionAudioParts.add(path);
     else if (path != null && _isSystemInterrupted)
       File(path).delete().catchError((_) {});
 
-    // 💡 只有當有錄到東西時，才開始分析合併
     if (_sessionAudioParts.isNotEmpty) {
       String title = manualStop && recordingPart == 1
           ? "會議錄音"
@@ -1994,9 +1964,8 @@ class _MainAppShellState extends State<MainAppShell>
       _lastAmplitude = 0.0;
       _sessionAudioParts = [];
     });
-  } // 清空準備下一次錄音
+  }
 
-  // 👇 1.0.46 修改：支援接收 List<String> paths 👇
   void createNewNoteAndAnalyze(List<String> paths, String defaultTitle,
       {required DateTime date}) async {
     final newNote = MeetingNote(
@@ -2004,13 +1973,13 @@ class _MainAppShellState extends State<MainAppShell>
       title: "$defaultTitle (${DateFormat('yyyy/MM/dd').format(date)})",
       date: date,
       summary: ["AI 分析中..."],
-      audioPath: paths.isNotEmpty ? paths.first : "", // 相容舊版
-      audioParts: paths, // 💡 多段音訊來源
+      audioPath: paths.isNotEmpty ? paths.first : "",
+      audioParts: paths,
       status: NoteStatus.processing,
     );
     await GlobalManager.saveNote(newNote);
     GlobalManager.analyzeNote(newNote);
-    GlobalManager.addLog("🛑 結束並儲存錄音...");
+    GlobalManager.addLog("🛑 結束並儲存錄音，開始無縫背景分析...");
     if (mounted) setState(() {});
   }
 
@@ -2048,8 +2017,7 @@ class _MainAppShellState extends State<MainAppShell>
         } catch (e) {
           GlobalManager.addLog("取得檔案時間失敗: $e");
         }
-        createNewNoteAndAnalyze([file.path], "匯入錄音",
-            date: fileDate); // 💡 修改：包成 List
+        createNewNoteAndAnalyze([file.path], "匯入錄音", date: fileDate);
       }
     } else {
       if (mounted)
@@ -2097,7 +2065,6 @@ class _MainAppShellState extends State<MainAppShell>
         var video = await yt.videos.get(url);
         note.title = "YT: ${video.title}";
         note.currentStep = "正在下載音訊串流...";
-        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await GlobalManager.saveNote(note);
 
         var manifest = await yt.videos.streamsClient.getManifest(video.id);
@@ -2115,13 +2082,11 @@ class _MainAppShellState extends State<MainAppShell>
             await fileStream.close();
             break;
           } catch (e) {
-            GlobalManager.addLog("YT純音訊串流失敗 (嘗試備案): $e");
             audioFile = null;
           }
         }
 
         if (audioFile == null) {
-          GlobalManager.addLog("所有純音訊失敗，嘗試備用綜合串流...");
           var muxedStreams = manifest.muxed.sortByBitrate().toList();
           for (var streamInfo in muxedStreams) {
             try {
@@ -2136,19 +2101,17 @@ class _MainAppShellState extends State<MainAppShell>
               await fileStream.close();
               break;
             } catch (e) {
-              GlobalManager.addLog("YT備用串流失敗: $e");
               audioFile = null;
             }
           }
         }
 
         if (audioFile == null || !(await audioFile.exists()))
-          throw Exception("下載失敗。可能受到 YouTube 機器人防護阻擋或 DNS 污染。");
+          throw Exception("下載失敗。");
 
         note.audioPath = audioFile.path;
         note.audioParts = [audioFile.path];
         note.currentStep = '準備進行分析...';
-        _log("🔄 狀態更新: ${note.currentStep}"); // 💡 補上這行
         await GlobalManager.saveNote(note);
         GlobalManager.analyzeNote(note);
       } catch (e) {
@@ -2162,8 +2125,8 @@ class _MainAppShellState extends State<MainAppShell>
             context: context,
             builder: (ctx) => AlertDialog(
               title: const Text("YouTube 解析失敗"),
-              content: const Text(
-                  "可能受到 YouTube 防爬蟲機制阻擋。\n是否為您開啟外部下載網頁 (yt5s.rip)？\n\n💡 請在網頁下載完 MP4 或 MP3 後，回到 APP 點擊「匯入本地錄音/音檔」。"),
+              content:
+                  const Text("可能受到 YouTube 防爬蟲機制阻擋。\n是否為您開啟外部下載網頁 (yt5s.rip)？"),
               actions: [
                 TextButton(
                     onPressed: () => Navigator.pop(ctx),
@@ -2457,7 +2420,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
   bool _isPlaying = false;
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
-  // 👇 1.0.46 修改：無縫播放器參數 👇
   final List<double> _partOffsets = [];
   int _currentPlayingPartIndex = 0;
   final ScrollController _transcriptScrollController = ScrollController();
@@ -2473,7 +2435,7 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     super.initState();
     _note = widget.note;
     _tabController = TabController(length: 3, vsync: this);
-    _initAudioOffsets(); // 💡 初始化各段落長度
+    _initAudioOffsets();
 
     if (_note.status == NoteStatus.processing ||
         _note.status == NoteStatus.downloading) {
@@ -2488,11 +2450,9 @@ class _NoteDetailPageState extends State<NoteDetailPage>
       });
     }
 
-    // 由於是拼接的，我們在 _initAudioOffsets 計算總長度，不採用單一檔案的 duration
     _audioPlayer.onPlayerStateChanged.listen((state) {
       if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
     });
-    // 👇 1.0.46 修改開始：無縫拼接時間軸計算與換軌 👇
     _audioPlayer.onPositionChanged.listen((p) {
       if (mounted) {
         double offset = (_partOffsets.isNotEmpty &&
@@ -2551,7 +2511,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     });
   }
 
-  // 👇 1.0.46 修改：初始化拼接時間點 👇
   Future<void> _initAudioOffsets() async {
     List<String> paths =
         _note.audioParts.isNotEmpty ? _note.audioParts : [_note.audioPath];
@@ -2595,7 +2554,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     super.dispose();
   }
 
-  // 👇 1.0.54 修改雙擊播放 👇
   Future<void> _playPause() async {
     if (_isPlaying)
       await _audioPlayer.pause();
@@ -2609,17 +2567,17 @@ class _NoteDetailPageState extends State<NoteDetailPage>
         if (_audioPlayer.source == null)
           await _audioPlayer.play(DeviceFileSource(actualFile.path));
         else
-          await _audioPlayer.resume(); // 💡 修正：如果已經有來源，直接解除暫停
+          await _audioPlayer.resume();
       } else
         ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text("找不到此音檔，可能已被系統清除")));
+            .showSnackBar(const SnackBar(content: Text("找不到此音檔")));
     }
   }
 
   Future<void> _seekAndPlay(double seconds) async {
     await _seekTo(seconds);
-    await Future.delayed(const Duration(milliseconds: 150)); // 💡 給予 seek 緩衝時間
-    if (!_isPlaying) await _audioPlayer.resume(); // 💡 修正：強制使用 resume() 解除暫停
+    await Future.delayed(const Duration(milliseconds: 150));
+    if (!_isPlaying) await _audioPlayer.resume();
   }
 
   Future<void> _seekTo(double seconds) async {
@@ -2680,7 +2638,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // 💡 1.0.59 新增：編輯摘要與任務
   void _editSummaryItem(int index) {
     TextEditingController controller =
         TextEditingController(text: _note.summary[index]);
@@ -3067,7 +3024,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                                       GlobalManager.typoListNotifier.value);
                                   list.add("$w ➡️ $c");
                                   GlobalManager.saveTypoList(list);
-                                  // 💡 貼心功能：自動幫使用者把當前輸入框內的錯字替換掉！
                                   setState(() {
                                     controller.text =
                                         controller.text.replaceAll(w, c);
@@ -3085,7 +3041,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
                     );
                   },
                 ),
-                // 💡 1.0.59 新增：局部語言重聽按鈕
                 IconButton(
                   icon: const Icon(Icons.language, color: Colors.blue),
                   tooltip: "局部外語重聽 (解決漏字或外語辨識錯誤)",
@@ -3478,7 +3433,6 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     );
   }
 
-  // 💡 1.0.59 新增：摘要與任務支援長按編輯
   Widget _buildSummaryTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -3756,7 +3710,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _groqKeyController = TextEditingController();
   final TextEditingController _deepgramKeyController = TextEditingController();
 
-  String _analysisStrategy = 'deepgram_gemini';
+  String _analysisStrategy = 'flash'; // 💡 預設改為 Flash 原生模式
   String _sttLanguage = 'zh';
   bool _isLoadingModels = false;
   bool _isLoadingExternalSTT = false;
@@ -3773,8 +3727,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _apiKeyController.text = prefs.getString('api_key') ?? '';
       _groqKeyController.text = prefs.getString('groq_api_key') ?? '';
       _deepgramKeyController.text = prefs.getString('deepgram_api_key') ?? '';
-      _analysisStrategy =
-          prefs.getString('analysis_strategy') ?? 'deepgram_gemini';
+      _analysisStrategy = prefs.getString('analysis_strategy') ?? 'flash';
       _sttLanguage = prefs.getString('stt_language') ?? 'zh';
     });
   }
@@ -3785,17 +3738,18 @@ class _SettingsPageState extends State<SettingsPage> {
     String steps = "";
     if (type == 'gemini') {
       title = "取得 Gemini API Key";
-      url = "https://aistudio.google.com/app/apikey";
+      url =
+          "[https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)";
       steps =
           "1. 點擊下方按鈕前往 Google AI Studio\n2. 登入 Google 帳號\n3. 點擊畫面上的「Create API key」\n4. 複製金鑰並貼上至此處";
     } else if (type == 'deepgram') {
       title = "取得 Deepgram API Key";
-      url = "https://console.deepgram.com/";
+      url = "[https://console.deepgram.com/](https://console.deepgram.com/)";
       steps =
           "1. 點擊下方按鈕前往 Deepgram\n2. 註冊並登入帳號 (註冊即贈 \$200 額度)\n3. 在左側選單進入「API Keys」\n4. 點擊「Create a New API Key」\n5. 複製金鑰並貼上至此處";
     } else if (type == 'groq') {
       title = "取得 Groq API Key";
-      url = "https://console.groq.com/keys";
+      url = "[https://console.groq.com/keys](https://console.groq.com/keys)";
       steps =
           "1. 點擊下方按鈕前往 Groq Cloud\n2. 登入帳號\n3. 點擊「Create API Key」\n4. 複製金鑰並貼上至此處";
     }
@@ -3820,7 +3774,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (rawKeys.isEmpty) {
       _showApiKeyGuide('gemini');
       return;
-    } // 💡 空白時彈出教學
+    }
     setState(() => _isLoadingModels = true);
     final firstKey = rawKeys
         .split(',')
@@ -3840,7 +3794,6 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  // 💡 合併測試外部 STT 引擎
   Future<void> _testExternalSTT() async {
     if (_analysisStrategy == 'groq_gemini' && _groqKeyController.text.isEmpty) {
       _showApiKeyGuide('groq');
@@ -3935,7 +3888,7 @@ class _SettingsPageState extends State<SettingsPage> {
               maxLines: 1,
               obscureText: true,
               decoration: const InputDecoration(
-                  labelText: "Deepgram API Key (推薦，內建講者辨識)",
+                  labelText: "Deepgram API Key (備用 STT)",
                   hintText: "至 console.deepgram.com 免費申請",
                   border: OutlineInputBorder(),
                   suffixIcon: Icon(Icons.mic))),
@@ -3992,14 +3945,15 @@ class _SettingsPageState extends State<SettingsPage> {
                       isExpanded: true,
                       items: const [
                         DropdownMenuItem(
+                            value: 'flash',
+                            child: Text(
+                                "🏆 首選：原生語音模式 (純 Gemini Flash - 最懂語意)")), // 💡 依據實測結果調整 UI 優先級
+                        DropdownMenuItem(
                             value: 'deepgram_gemini',
-                            child: Text("🚀 首選模式 (Deepgram STT + Gemini 摘要)")),
+                            child: Text("🥈 備案：雙引擎模式 (Deepgram + Gemini)")),
                         DropdownMenuItem(
                             value: 'groq_gemini',
-                            child: Text("🥈 備案模式 (Groq STT + Gemini 摘要)")),
-                        DropdownMenuItem(
-                            value: 'flash',
-                            child: Text("原生語音模式 (純 Gemini Flash)")),
+                            child: Text("🥉 備案：雙引擎模式 (Groq + Gemini)")),
                         DropdownMenuItem(
                             value: 'pro', child: Text("精準高密模式 (純 Gemini Pro)"))
                       ],
@@ -4008,7 +3962,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         _saveSettings();
                       }))),
           const SizedBox(height: 4),
-          const Text("💡 提示：Deepgram 準確率極高且內建完美講者辨識，大幅減少 Gemini 幻覺與猜錯人的機率。",
+          const Text("💡 提示：Gemini Flash 原生模式能直接聆聽語氣並理解多國語言夾雜，為複雜會議的最佳選擇。",
               style: TextStyle(fontSize: 12, color: Colors.green)),
           const SizedBox(height: 20),
           const Text("主要錄音語系 (STT 引擎提示)",
@@ -4038,70 +3992,64 @@ class _SettingsPageState extends State<SettingsPage> {
                         _saveSettings();
                       }))),
           const SizedBox(height: 20),
-          // 👇 💡 細化各項目成本的 UI 👇
           Card(
-            color: Colors.blue.shade50,
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(Icons.monetization_on, color: Colors.blue),
-                          SizedBox(width: 8),
-                          Text("動態成本估算器",
-                              style: TextStyle(
-                                  fontWeight: FontWeight.bold, fontSize: 16)),
-                        ],
-                      ),
-                      Text("第 $daysSinceFirstUse 天",
-                          style: const TextStyle(
-                              fontSize: 12, color: Colors.grey)),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                      "🎙️ Deepgram STT 音訊: ${(UsageTracker.deepgramAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${deepgramCost.toStringAsFixed(3)})",
-                      style: const TextStyle(fontSize: 13)),
-                  Text(
-                      "🎙️ Groq STT 音訊: ${(UsageTracker.groqAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${groqCost.toStringAsFixed(3)})",
-                      style: const TextStyle(fontSize: 13)),
-                  Text(
-                      "📝 Gemini 純文字請求: ${UsageTracker.geminiTextRequests} 次 (\$${geminiTextCost.toStringAsFixed(3)})",
-                      style: const TextStyle(fontSize: 13)),
-                  Text(
-                      "🔊 Gemini 備案音訊: ${(UsageTracker.geminiAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${geminiAudioCost.toStringAsFixed(3)})",
-                      style: const TextStyle(fontSize: 13)),
-                  const Divider(),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text("目前累積成本 (約):"),
-                      Text("\$${totalCurrentCost.toStringAsFixed(3)} USD",
-                          style: const TextStyle(fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text("預估 30 天月費:"),
-                      Text("\$${projectedMonthlyCost.toStringAsFixed(2)} USD",
-                          style: const TextStyle(
-                              fontWeight: FontWeight.bold, color: Colors.red)),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
+              color: Colors.blue.shade50,
+              child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Row(children: [
+                                Icon(Icons.monetization_on, color: Colors.blue),
+                                SizedBox(width: 8),
+                                Text("動態成本估算器",
+                                    style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 16))
+                              ]),
+                              Text("第 $daysSinceFirstUse 天",
+                                  style: const TextStyle(
+                                      fontSize: 12, color: Colors.grey))
+                            ]),
+                        const SizedBox(height: 12),
+                        Text(
+                            "🎙️ Deepgram STT 音訊: ${(UsageTracker.deepgramAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${deepgramCost.toStringAsFixed(3)})",
+                            style: const TextStyle(fontSize: 13)),
+                        Text(
+                            "🎙️ Groq STT 音訊: ${(UsageTracker.groqAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${groqCost.toStringAsFixed(3)})",
+                            style: const TextStyle(fontSize: 13)),
+                        Text(
+                            "📝 Gemini 純文字請求: ${UsageTracker.geminiTextRequests} 次 (\$${geminiTextCost.toStringAsFixed(3)})",
+                            style: const TextStyle(fontSize: 13)),
+                        Text(
+                            "🔊 Gemini 原生音訊: ${(UsageTracker.geminiAudioSeconds / 3600).toStringAsFixed(2)} 小時 (\$${geminiAudioCost.toStringAsFixed(3)})",
+                            style: const TextStyle(fontSize: 13)),
+                        const Divider(),
+                        Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text("目前累積成本 (約):"),
+                              Text(
+                                  "\$${totalCurrentCost.toStringAsFixed(3)} USD",
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold))
+                            ]),
+                        const SizedBox(height: 4),
+                        Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text("預估 30 天月費:"),
+                              Text(
+                                  "\$${projectedMonthlyCost.toStringAsFixed(2)} USD",
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.red))
+                            ])
+                      ]))),
           const SizedBox(height: 20),
-
-          // 💡 1.0.59 新增：專屬的字典管理頁面入口
           const Divider(),
           ListTile(
             contentPadding: EdgeInsets.zero,
@@ -4126,7 +4074,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-// 💡 1.0.59 新增：獨立的字典管理頁面
 class DictionaryPage extends StatefulWidget {
   const DictionaryPage({super.key});
   @override
@@ -4291,7 +4238,7 @@ class LogViewerPage extends StatelessWidget {
             icon: const Icon(Icons.delete),
             onPressed: () {
               GlobalManager.logsNotifier.value = [];
-              GlobalManager.addLog("APP 啟動 (版本: $APP_VERSION)"); // 💡 清除後顯示版本號
+              GlobalManager.addLog("APP 啟動 (版本: $APP_VERSION)");
             },
           ),
           IconButton(
