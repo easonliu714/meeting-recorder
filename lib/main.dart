@@ -24,7 +24,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:audio_session/audio_session.dart' as as_lib;
 import 'package:url_launcher/url_launcher.dart';
 
-const String APP_VERSION = "1.0.60"; // 💡 延伸 ForegroundTask 到 AI 分析階段，徹底防斷網
+const String APP_VERSION = "1.0.61"; // 💡 修正Gemini提示詞、另存STT聽寫稿避免被覆寫
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -372,7 +372,7 @@ class DeepgramApi {
       String apiKey, File audioFile, String sttLanguage) async {
     String langParam = sttLanguage == 'zh' ? 'zh-TW' : sttLanguage;
     String urlStr =
-        'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&utterances=true&punctuate=true&filler_words=true';
+        'https://api.deepgram.com/v1/listen?model=nova-2&diarize=true&utterances=true&punctuate=true&filler_words=true&smart_format=true';
     if (langParam == 'auto')
       urlStr += '&detect_language=true';
     else
@@ -510,7 +510,10 @@ class GeminiRestApi {
             retryCount++;
             continue;
           }
-          if (response.statusCode == 404 || response.statusCode == 400) break;
+          if (response.statusCode == 404 || response.statusCode == 400) {
+            _log("⚠️ 模型 $currentModel 不可用，切換備援模型...");
+            break;
+          }
           if (response.statusCode != 200)
             throw Exception('Generate failed: ${response.body}');
 
@@ -577,7 +580,6 @@ class GeminiRestApi {
               }
             }
 
-            // 💡 1.0.60 確保括號正確閉合
             if (response.statusCode == 404 || response.statusCode == 400) {
               _log("⚠️ 模型 $currentModel 不可用，切換備援模型...");
               break;
@@ -793,7 +795,6 @@ class GlobalManager {
     return File('${dir.path}/$fileName');
   }
 
-  // 💡 1.0.60 核心：確保 AI 處理期間 ForegroundService 持續運作，阻擋系統斷網
   static Future<void> _updateForegroundTask(String text) async {
     if (await FlutterForegroundTask.isRunningService) {
       FlutterForegroundTask.updateService(
@@ -812,18 +813,28 @@ class GlobalManager {
     }
   }
 
+  // 💡 1.0.61 實體隔離：將原始聽寫稿直接寫入實體檔案，保護不被覆蓋
+  static Future<void> _saveRawSttToFile(String noteId, String content) async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/${noteId}_raw_stt.txt');
+      await file.writeAsString(content);
+    } catch (e) {
+      _log("保存原始 STT 檔案失敗: $e");
+    }
+  }
+
   static Future<void> analyzeNote(MeetingNote note) async {
     await WakelockPlus.enable();
     note.status = NoteStatus.processing;
     note.currentStep = "準備讀取音檔...";
     _log("🔄 狀態更新: ${note.currentStep}");
-    await _updateForegroundTask(note.currentStep); // 💡 通知系統保持網路
+    await _updateForegroundTask(note.currentStep);
     await saveNote(note);
 
     final prefs = await SharedPreferences.getInstance();
     final List<String> apiKeys = await getApiKeys();
-    String strategy =
-        prefs.getString('analysis_strategy') ?? 'flash'; // 💡 預設改為 flash
+    String strategy = prefs.getString('analysis_strategy') ?? 'flash';
     final String groqKey = prefs.getString('groq_api_key') ?? '';
     final String sttLanguage = prefs.getString('stt_language') ?? 'zh';
     final List<String> vocabList = vocabListNotifier.value;
@@ -839,6 +850,9 @@ class GlobalManager {
       double globalOffsetSeconds = 0.0;
       List<dynamic> allWhisperSegments = [];
 
+      // ==========================================
+      // STT 雙引擎模式 (Deepgram / Groq)
+      // ==========================================
       if (strategy == 'groq_gemini' || strategy == 'deepgram_gemini') {
         final bool isDeepgram = strategy == 'deepgram_gemini';
         final String externalKey =
@@ -902,16 +916,18 @@ class GlobalManager {
           note.transcript = rawTranscript;
           await saveNote(note);
 
-          note.currentStep = "Gemini 全局摘要生成中...";
-          _log("🔄 狀態更新: ${note.currentStep}");
-          await _updateForegroundTask(note.currentStep);
-          await saveNote(note);
-
+          // 💡 1.0.61 實體隔離：立刻將原始結果寫入本機檔案，不受後續淨化污染
           StringBuffer fullRawText = StringBuffer();
           for (var seg in allWhisperSegments) {
             fullRawText.writeln(
                 "[${seg['start']}秒] ${seg['speaker']}: ${seg['text']}");
           }
+          await _saveRawSttToFile(note.id, fullRawText.toString());
+
+          note.currentStep = "Gemini 全局摘要生成中...";
+          _log("🔄 狀態更新: ${note.currentStep}");
+          await _updateForegroundTask(note.currentStep);
+          await saveNote(note);
 
           String summaryPrompt = """
           這是一份會議原始逐字稿（可能包含錯字或環境雜音）：
@@ -957,7 +973,7 @@ class GlobalManager {
             await saveNote(note);
           } catch (e) {
             _log("⚠️ 全局摘要生成失敗: $e");
-            note.summary = ["基於原始逐字稿摘要失敗，將在淨化後重試。"];
+            note.summary = ["【初步摘要生成失敗，系統將於逐字稿淨化完成後，自動為您重整摘要】"];
           }
 
           List<TranscriptItem> fullTranscript = [];
@@ -997,7 +1013,9 @@ class GlobalManager {
               請扮演極度嚴格的「會議記錄淨化員」，執行以下任務：
               1. 【修復碎裂與人名校正】：將代號替換為真實人名。STT 引擎可能會切得太碎或產生空格。務必「清除所有中文字之間的空格」，將過度碎裂的短句合併成語意通順的長句！若有發音相近人名請強制校正。
               2. 【強制字典修正】：請修正錯字。
-              3. 【語言與翻譯】：外語放 original，羅馬拼音放 phonetic，繁體翻譯放 translation。中文其餘留空。
+              3. 【語言與欄位填寫】：(極度重要)
+                 - 若該句話是中文：將原文放 original 欄位，phonetic 與 translation 必須留空。
+                 - 若該句話是外語（英日韓等）：將原文放 original 欄位，羅馬拼音放 phonetic 欄位，繁體中文翻譯放 translation 欄位。
               4. 刪除與上下文毫無關聯的外語幻覺。
               $typoInstruction
               5. 嚴格保留原始 [秒數] 填入 startTime。
@@ -1028,13 +1046,27 @@ class GlobalManager {
             }
           }
           if (fullTranscript.isNotEmpty) note.transcript = fullTranscript;
-          note.status = NoteStatus.success;
-          note.currentStep = '';
           await saveNote(note);
+
+          // 若初期摘要失敗，在此自動重整
+          if (note.summary.isNotEmpty && note.summary[0].contains("失敗")) {
+            note.currentStep = "逐字稿已完成，正在補成全局摘要...";
+            _log("🔄 狀態更新: ${note.currentStep}");
+            await _updateForegroundTask(note.currentStep);
+            await reSummarizeFromTranscript(note);
+          } else {
+            note.status = NoteStatus.success;
+            note.currentStep = '';
+            await saveNote(note);
+            _log("分析完成！");
+          }
           return;
         }
       }
 
+      // ==========================================
+      // 原生 Gemini 聽寫模式 (Flash / Pro)
+      // ==========================================
       if (strategy != 'groq_gemini') {
         modelsToTry = strategy == 'pro'
             ? ['gemini-pro-latest', 'gemini-2.5-pro']
@@ -1048,7 +1080,9 @@ class GlobalManager {
         final duration = await tempPlayer.getDuration();
         await tempPlayer.dispose();
         double totalSeconds = (duration?.inMilliseconds ?? 0) / 1000.0;
-        int chunkSize = strategy == 'pro' ? 120 : 300;
+
+        // 💡 1.0.61 優化：縮短 Chunk 大小，避免 Gemini 輸出 JSON 斷尾
+        int chunkSize = strategy == 'pro' ? 120 : 200;
         if (totalSeconds <= 0) totalSeconds = chunkSize * 36.0;
         int maxChunks = (totalSeconds / chunkSize).ceil();
         if (maxChunks == 0) maxChunks = 1;
@@ -1110,6 +1144,8 @@ class GlobalManager {
               [];
         } catch (e) {
           _log("摘要產生遇到問題: $e");
+          // 💡 1.0.61 摘要失敗自動補救機制
+          note.summary = ["【初步摘要生成失敗，系統將於逐字稿聽打完成後，自動為您重整摘要】"];
         }
 
         List<TranscriptItem> fullTranscript = [];
@@ -1118,6 +1154,7 @@ class GlobalManager {
         String typoInstruction = typoList.isNotEmpty
             ? "【歷史錯字替換】：請嚴格參考此對應表(錯字 ➡️ 正確字)：${typoList.join(' , ')}"
             : "";
+        String previousContext = "";
 
         for (int i = 0; i < maxChunks; i++) {
           note.currentStep = "原生語音聽打 (${i + 1}/$maxChunks)...";
@@ -1131,17 +1168,22 @@ class GlobalManager {
               ? (totalSeconds - chunkStart)
               : chunkSize.toDouble();
 
+          // 💡 1.0.61 優化：加入前情提要防斷層，嚴格限制時間戳起點防幻覺
           String transcriptPrompt = """
-          請扮演極度專業的「多語系逐字稿聽打員」。這是一份長音檔，請你【嚴格且只針對】第 $chunkStart 秒 到第 $chunkEnd 秒的音訊片段提供逐字稿。
+          請扮演極度專業的「會議記錄聽打員」。這是一份長音檔，請你【嚴格且只針對】第 $chunkStart 秒 到第 $chunkEnd 秒的音訊片段提供逐字稿。
           【會議全局上下文】：$contextInfo
           專有詞彙庫：${vocabList.join(', ')}。預期與會者名單：${participantList.join(', ')}。
+          
+          ${previousContext.isNotEmpty ? '【前情提要】：上一段最後的對話是：「\n$previousContext\n」。\n請從這句話「之後」接續聽打，絕對不要重複前情提要的內容！' : ''}
+
           【極度重要限制】：
-          1. 絕對不可從 0 秒開始聽打！精準從第 $chunkStart 秒開始。
-          2. 如果片段裡面是「靜音」，請直接回傳空陣列 []。
-          3. 【強制短句斷點】：單一句子長度超過 10 秒必須斷開。
-          4. 【講者辨識】：請根據聲音特徵與「全局上下文」，精準標註講者。
+          1. 絕對不可從 0 秒開始聽打！精準從第 $chunkStart 秒開始，到第 $chunkEnd 秒結束。
+          2. 如果這段時間內是「靜音」或無人說話，請直接回傳空陣列 []。
+          3. 【時間戳】：startTime 必須大於等於 $chunkStart。如果發現你打出的時間是 0，代表你聽錯段落了，請重新對齊時間！
+          4. 單一句子長度超過 10 秒必須斷開。
+          5. 【講者辨識】：請根據聲音特徵與「全局上下文」，精準標註講者。
           $typoInstruction
-          請回傳純 JSON 陣列。
+          請直接回傳純 JSON 陣列。
           """;
 
           bool chunkSuccess = false;
@@ -1163,12 +1205,28 @@ class GlobalManager {
                 emptyCount = 0;
                 var newItems =
                     chunkList.map((e) => TranscriptItem.fromJson(e)).toList();
-                newItems.removeWhere((item) => item.startTime > totalSeconds);
-                fullTranscript.addAll(newItems);
+
+                // 💡 1.0.61 嚴格時間濾波器：自動剔除超出此片段時間範圍的幻覺文字 (容許前後 15 秒緩衝)
+                newItems.removeWhere((item) =>
+                    item.startTime < (chunkStart - 15.0) ||
+                    item.startTime > (chunkEnd + 30.0));
+
+                if (newItems.isNotEmpty) {
+                  fullTranscript.addAll(newItems);
+                  // 擷取最後兩句作為下一段的前情提要
+                  var lastItems = newItems.length > 2
+                      ? newItems.sublist(newItems.length - 2)
+                      : newItems;
+                  previousContext = lastItems
+                      .map((e) =>
+                          "[${e.startTime}秒] ${e.speaker}: ${e.original}")
+                      .join('\n');
+                }
               }
               chunkSuccess = true;
             } catch (e) {
-              if (e.toString().contains("RESOURCE_EXHAUSTED")) {
+              if (e.toString().contains("RESOURCE_EXHAUSTED") ||
+                  e.toString().contains("Quota")) {
                 currentKeyIndex++;
                 if (currentKeyIndex >= apiKeys.length)
                   throw Exception("所有 API Key 均已耗盡！");
@@ -1179,18 +1237,38 @@ class GlobalManager {
                 fileUri = fileInfo['uri'];
                 await GeminiRestApi.waitForFileActive(
                     lockedKey, fileInfo['name'].split('/').last);
+                // 💡 迴圈不會 break，將使用新 Key 重試這一個片段！
               } else {
                 _log("分段 $i 失敗: $e");
-                chunkSuccess = true;
+                chunkSuccess = true; // 放棄此段，繼續下一段
               }
             }
           }
         }
+
         note.transcript = fullTranscript;
-        note.status = NoteStatus.success;
-        note.currentStep = '';
         await saveNote(note);
-        _log("分析完成！");
+
+        // 💡 1.0.61 實體隔離：將原生聽打結果也寫入 Raw 檔備份
+        StringBuffer rawTextBuffer = StringBuffer();
+        for (var item in fullTranscript) {
+          rawTextBuffer.writeln(
+              "[${item.startTime}秒] ${item.speaker}: ${item.original}");
+        }
+        await _saveRawSttToFile(note.id, rawTextBuffer.toString());
+
+        // 💡 若初期摘要失敗，在此自動重整
+        if (note.summary.isNotEmpty && note.summary[0].contains("失敗")) {
+          note.currentStep = "逐字稿已完成，正在補成全局摘要...";
+          _log("🔄 狀態更新: ${note.currentStep}");
+          await _updateForegroundTask(note.currentStep);
+          await reSummarizeFromTranscript(note);
+        } else {
+          note.status = NoteStatus.success;
+          note.currentStep = '';
+          await saveNote(note);
+          _log("分析完成！");
+        }
       }
     } catch (e) {
       _log("分析流程錯誤: $e");
@@ -1200,7 +1278,7 @@ class GlobalManager {
       await saveNote(note);
     } finally {
       await WakelockPlus.disable();
-      await _stopForegroundTaskIfNotRecording(); // 💡 分析完畢，解除背景鎖
+      await _stopForegroundTaskIfNotRecording();
     }
   }
 
@@ -1251,6 +1329,7 @@ class GlobalManager {
               "[${item.startTime}秒] ${item.speaker}: ${item.original}");
         }
 
+        // 💡 1.0.61 修正語病，防止中文消失
         String textPrompt = """
         這是一場會議的局部逐字稿。
         【會議全局上下文】：$contextInfo
@@ -1263,7 +1342,9 @@ class GlobalManager {
         2. 參考最新與會者名單：${participantList.join(', ')}。根據上下文語意重新判斷說話者。並強制修正人名錯字。
         $typoInstruction
         3. 【極度重要】：絕對嚴格保留原始括號內的 [秒數] 填入 startTime！
-        4. 【語言與翻譯】：外語放 original，羅馬拼音放 phonetic，翻譯放 translation。中文其餘留空。
+        4. 【語言與欄位填寫】：(極度重要)
+           - 若該句話是中文：將原文放 original 欄位，phonetic 與 translation 必須留空。
+           - 若該句話是外語（英日韓等）：將原文放 original 欄位，羅馬拼音放 phonetic 欄位，繁體中文翻譯放 translation 欄位。
         請回傳純 JSON 陣列。
         """;
 
@@ -1905,7 +1986,6 @@ class _MainAppShellState extends State<MainAppShell>
 
       GlobalManager.isRecordingNotifier.value = true;
       await WakelockPlus.enable();
-      GlobalManager.addLog("開始錄音並啟用 Wakelock 防休眠");
     } else {
       if (mounted)
         ScaffoldMessenger.of(context)
@@ -1936,7 +2016,6 @@ class _MainAppShellState extends State<MainAppShell>
     stopwatch.stop();
     GlobalManager.isRecordingNotifier.value = false;
 
-    // 💡 1.0.60 修正：不急著關閉 ForegroundTask，讓分析階段無縫接手
     await WakelockPlus.disable();
 
     if (path != null &&
@@ -3190,23 +3269,34 @@ class _NoteDetailPageState extends State<NoteDetailPage>
     await _exportFile('md', md.toString());
   }
 
+  // 💡 1.0.61 優化：匯出永遠讀取被保護的本機 Raw 檔
   Future<void> _exportRawSTT() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final String strategy =
           prefs.getString('analysis_strategy') ?? 'deepgram_gemini';
       final String engineName =
-          strategy.contains('deepgram') ? 'Deepgram' : 'Groq';
-      StringBuffer raw = StringBuffer();
-      raw.writeln("【$engineName STT 原始聽寫稿 (除錯用)】\n會議標題: ${_note.title}\n");
-      for (var item in _note.transcript) {
-        raw.writeln("[${item.startTime}s] ${item.speaker}: ${item.original}");
-      }
+          strategy.contains('deepgram') ? 'Deepgram' : 'Gemini/Groq';
+
       final dir = await getApplicationDocumentsDirectory();
+      final internalFile = File('${dir.path}/${_note.id}_raw_stt.txt');
+      String content = "";
+
+      if (await internalFile.exists()) {
+        content = await internalFile.readAsString();
+      } else {
+        StringBuffer raw = StringBuffer();
+        for (var item in _note.transcript) {
+          raw.writeln("[${item.startTime}s] ${item.speaker}: ${item.original}");
+        }
+        content = raw.toString();
+      }
+
       final safeTitle = _note.title.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-      final file = File('${dir.path}/${safeTitle}_raw_stt.txt');
-      await file.writeAsString(raw.toString());
-      await Share.shareXFiles([XFile(file.path)], text: '匯出原始 STT 聽寫稿');
+      final exportFile = File('${dir.path}/${safeTitle}_raw_stt.txt');
+      await exportFile.writeAsString(
+          "【$engineName STT 原始聽寫稿 (除錯用)】\n會議標題: ${_note.title}\n\n$content");
+      await Share.shareXFiles([XFile(exportFile.path)], text: '匯出原始 STT 聽寫稿');
     } catch (e) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text("匯出失敗: $e")));
@@ -3710,7 +3800,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _groqKeyController = TextEditingController();
   final TextEditingController _deepgramKeyController = TextEditingController();
 
-  String _analysisStrategy = 'flash'; // 💡 預設改為 Flash 原生模式
+  String _analysisStrategy = 'flash';
   String _sttLanguage = 'zh';
   bool _isLoadingModels = false;
   bool _isLoadingExternalSTT = false;
@@ -3946,8 +4036,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       items: const [
                         DropdownMenuItem(
                             value: 'flash',
-                            child: Text(
-                                "🏆 首選：原生語音模式 (純 Gemini Flash - 最懂語意)")), // 💡 依據實測結果調整 UI 優先級
+                            child: Text("🏆 首選：原生語音模式 (純 Gemini Flash)")),
                         DropdownMenuItem(
                             value: 'deepgram_gemini',
                             child: Text("🥈 備案：雙引擎模式 (Deepgram + Gemini)")),
